@@ -1,21 +1,23 @@
-# https://huggingface.co/spaces/SmilingWolf/wd-v1-4-tags
-
-import comfy.utils
-import asyncio
-import aiohttp
+from comfy_api.latest import ComfyExtension, io
 import numpy as np
 import csv
+import asyncio
 import os
+import aiohttp
+import folder_paths
 import sys
-import onnxruntime as ort
-import hashlib
-from onnxruntime import InferenceSession
-from PIL import Image
+import onnxruntime
 from server import PromptServer
 from aiohttp import web
-import folder_paths
+from PIL import Image
 from .pysssss import get_ext_dir, get_comfy_dir, download_to_file, update_node_status, wait_for_async, get_extension_config, log
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "comfy"))
+from onnxruntime import InferenceSession
+from typing_extensions import override
+from comfy import utils
+
+
+sys.path.insert(0, os.path.join(
+    os.path.dirname(os.path.realpath(__file__)), "comfy"))
 
 config = get_extension_config()
 
@@ -39,12 +41,16 @@ else:
     models_dir = get_ext_dir("models", mkdir=True)
 known_models = list(config["models"].keys())
 
-log("Available ORT providers: " + ", ".join(ort.get_available_providers()), "DEBUG", True)
-log("Using ORT providers: " + ", ".join(defaults["ortProviders"]), "DEBUG", True)
+log("Available ORT providers: " +
+    ", ".join(onnxruntime.get_available_providers()), "DEBUG", True)
+log("Using ORT providers: " +
+    ", ".join(defaults["ortProviders"]), "DEBUG", True)
+
 
 def get_installed_models():
     models = filter(lambda x: x.endswith(".onnx"), os.listdir(models_dir))
-    models = [m for m in models if os.path.exists(os.path.join(models_dir, os.path.splitext(m)[0] + ".csv"))]
+    models = [m for m in models if os.path.exists(
+        os.path.join(models_dir, os.path.splitext(m)[0] + ".csv"))]
     return models
 
 
@@ -64,7 +70,7 @@ async def tag(image, model_name, replace_underscore=True, client_id=None, node=N
     # Reduce to max size and pad with white
     ratio = float(height)/max(image.size)
     new_size = tuple([int(x*ratio) for x in image.size])
-    image = image.resize(new_size, Image.LANCZOS)
+    image = image.resize(new_size, Image.Resampling.LANCZOS)
     square = Image.new("RGB", (height, height), (255, 255, 255))
     square.paste(image, ((height-new_size[0])//2, (height-new_size[1])//2))
 
@@ -95,16 +101,20 @@ async def tag(image, model_name, replace_underscore=True, client_id=None, node=N
     result = list(zip(tags, probs[0]))
     return (result, general_index, character_index)
 
+
 def get_tag(result, general_index, character_index, threshold=0.35, character_threshold=0.85, trailing_comma=False, exclude_tags=""):
     # rating = max(result[:general_index], key=lambda x: x[1])
-    general = [item for item in result[general_index:character_index] if item[1] > threshold]
-    character = [item for item in result[character_index:] if item[1] > character_threshold]
+    general = [item for item in result[general_index:character_index]
+               if item[1] > threshold]
+    character = [item for item in result[character_index:]
+                 if item[1] > character_threshold]
 
     all = character + general
     remove = [s.strip() for s in exclude_tags.lower().split(",")]
     all = [tag for tag in all if tag[0] not in remove]
 
-    res = ("" if trailing_comma else ", ").join((item[0].replace("(", "\\(").replace(")", "\\)") + (", " if trailing_comma else "") for item in all))
+    res = ("" if trailing_comma else ", ").join((item[0].replace(
+        "(", "\\(").replace(")", "\\)") + (", " if trailing_comma else "") for item in all))
 
     print(res)
     return res
@@ -130,10 +140,10 @@ async def download_model(model, client_id, node):
 
         try:
             await download_to_file(
-                f"{url}model.onnx", os.path.join(models_dir,f"{model}.onnx"), update_callback, session=session)
+                f"{url}model.onnx", os.path.join(models_dir, f"{model}.onnx"), update_callback, session=session)
             await download_to_file(
-                f"{url}selected_tags.csv", os.path.join(models_dir,f"{model}.csv"), update_callback, session=session)
-        except aiohttp.client_exceptions.ClientConnectorError as err:
+                f"{url}selected_tags.csv", os.path.join(models_dir, f"{model}.csv"), update_callback, session=session)
+        except aiohttp.ClientConnectorError as err:
             log("Unable to download model. Download files manually or try using a HF mirror/proxy website by setting the environment variable HF_ENDPOINT=https://.....", "ERROR", True)
             raise
 
@@ -154,7 +164,7 @@ async def get_tags(request):
     target_dir = get_comfy_dir(type)
     image_path = os.path.abspath(os.path.join(
         target_dir, request.query.get("subfolder", ""), request.query["filename"]))
-    c = os.path.commonpath((image_path, target_dir))
+
     if os.path.commonpath((image_path, target_dir)) != target_dir:
         return web.Response(status=403)
 
@@ -170,80 +180,79 @@ async def get_tags(request):
     return web.json_response(await tag(image, model, client_id=request.rel_url.query.get("clientId", ""), node=request.rel_url.query.get("node", "")))
 
 
-class WD14Tagger:
+class WD14Tagger(io.ComfyNode):
     @classmethod
-    def INPUT_TYPES(s):
-        extra = [name for name, _ in (os.path.splitext(m) for m in get_installed_models()) if name not in known_models]
+    def define_schema(cls) -> io.Schema:
+        extra = [name for name, _ in (os.path.splitext(
+            m) for m in get_installed_models()) if name not in known_models]
         models = known_models + extra
-        return {"required": {
-            "image": ("IMAGE", ),
-            "model": (models, { "default": defaults["model"] }),
-            "threshold": ("FLOAT", {"default": defaults["threshold"], "min": 0.0, "max": 1, "step": 0.05}),
-            "character_threshold": ("FLOAT", {"default": defaults["character_threshold"], "min": 0.0, "max": 1, "step": 0.05}),
-            "replace_underscore": ("BOOLEAN", {"default": defaults["replace_underscore"]}),
-            "trailing_comma": ("BOOLEAN", {"default": defaults["trailing_comma"]}),
-            "cache": ("BOOLEAN", {"default": True}),
-            "exclude_tags": ("STRING", {"default": defaults["exclude_tags"]}),
-        }}
+        return io.Schema(
+            node_id="WD14Tagger",
+            category="image",
+            inputs=[
+                io.Image.Input("image"),
+                io.Combo.Input("model", options=models,
+                               default=defaults["model"]),
+                io.Float.Input("threshold", min=0.0, max=1.0,
+                               step=0.05, default=defaults["threshold"]),
+                io.Float.Input("character_threshold",
+                               min=0.0, max=1.0, step=0.05, default=defaults["character_threshold"]),
+                io.Boolean.Input("replace_underscore",
+                                 default=defaults["replace_underscore"]),
+                io.Boolean.Input("trailing_comma",
+                                 default=defaults["trailing_comma"]),
+                io.String.Input(
+                    "exclude_tags", default=defaults["exclude_tags"], multiline=True)
+            ],
+            outputs=[
+                io.String.Output("tags", is_output_list=True),
+            ]
+        )
 
-    RETURN_TYPES = ("STRING",)
-    OUTPUT_IS_LIST = (True,)
-    FUNCTION = "tag"
-    OUTPUT_NODE = True
-
-    CATEGORY = "image"
-
-    def __init__(self):
-        self.img_hash_map = {}
-        self.last_model = ""
-        self.if_replace_underscore = False
-        self.enable_cache = False
-
-    def tag(self, image, model, threshold, character_threshold, exclude_tags="", replace_underscore=False, trailing_comma=False, cache=False):
-        tensor = image*255
-        tensor = np.array(tensor, dtype=np.uint8)
-
-        if not cache:
-            if self.enable_cache:
-                print("Clear tagger cache: cache is disabled.")
-                self.img_hash_map = {}
-            self.enable_cache = False
-        else:
-            if self.last_model != model:
-                print("Clear tagger cache: model changes.")
-                self.last_model = model
-                self.img_hash_map = {}
-            if self.if_replace_underscore != replace_underscore:
-                print(f"Clear tagger cache: replace_underscore becomes {replace_underscore}.")
-                self.if_replace_underscore = replace_underscore
-                self.img_hash_map = {}
-            self.enable_cache = True
-        
-        pbar = comfy.utils.ProgressBar(tensor.shape[0])
+    @classmethod
+    def execute(cls, image, model, threshold, character_threshold, replace_underscore=False, trailing_comma=False, exclude_tags="") -> io.NodeOutput:
+        pbar = utils.ProgressBar(image.shape[0])
         tags = []
-        for i in range(tensor.shape[0]):
-            image = Image.fromarray(tensor[i])
+        for i in range(image.shape[0]):
+            img = Image.fromarray(np.array(image[i] * 255, dtype=np.uint8))
+            (result, general_index, character_index) = wait_for_async(
+                lambda: tag(img, model, replace_underscore))
 
-            if self.enable_cache:
-                img_hash = hashlib.sha256(image.tobytes()).hexdigest()
-                if img_hash in self.img_hash_map:
-                    (result, general_index, character_index) = self.img_hash_map.get(img_hash)
-                    print(f"Find cached image {img_hash}")
-                else:
-                    print(f"Caching new image {img_hash}")
-                    (result, general_index, character_index) = wait_for_async(lambda: tag(image, model, replace_underscore))
-                    self.img_hash_map[img_hash] = (result, general_index, character_index)
-            else:
-                (result, general_index, character_index) = wait_for_async(lambda: tag(image, model, replace_underscore))
-            
-            tags.append(get_tag(result, general_index, character_index, threshold, character_threshold, trailing_comma, exclude_tags))
+            tags.append(get_tag(result, general_index, character_index,
+                        threshold, character_threshold, trailing_comma, exclude_tags))
             pbar.update(1)
-        return {"ui": {"tags": tags}, "result": (tags,)}
+        return io.NodeOutput(tags)
+
+class UniqueTags(io.ComfyNode):
+    @classmethod
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="UniqueTags",
+            category="text",
+            inputs=[
+                io.String.Input("input_tags")
+            ],
+            outputs=[
+                io.String.Output("tags"),
+            ]
+        )
+
+    @classmethod
+    def execute(cls, input_tags) -> io.NodeOutput:
+        unique_tags = []
+        for tag in input_tags.split(','):
+            tag = tag.strip()
+            if len(tag) > 0 and tag not in unique_tags:
+                unique_tags.append(tag)
+        
+        unique_tags = ', '.join(unique_tags)
+        return io.NodeOutput(unique_tags)
 
 
-NODE_CLASS_MAPPINGS = {
-    "WD14Tagger|pysssss": WD14Tagger,
-}
-NODE_DISPLAY_NAME_MAPPINGS = {
-    "WD14Tagger|pysssss": "WD14 Tagger 🐍",
-}
+class WD14TaggerExtension(ComfyExtension):
+    @override
+    async def get_node_list(self) -> list[type[io.ComfyNode]]:
+        return [
+            WD14Tagger,
+            UniqueTags
+        ]

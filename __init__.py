@@ -1,6 +1,11 @@
 from .pysssss import init
+from .nodes import WD14TaggerExtension
 
-if init(check_imports=["onnxruntime"]):
-    from .wd14tagger import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
-    WEB_DIRECTORY = "./web"
-    __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS", "WEB_DIRECTORY"]
+WEB_DIRECTORY = "./web"
+
+async def comfy_entrypoint() -> WD14TaggerExtension:
+    if init(check_imports=["onnxruntime"]):
+        return WD14TaggerExtension()
+    else:
+        exit(1)
+

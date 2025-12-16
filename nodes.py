@@ -14,6 +14,7 @@ from .pysssss import get_ext_dir, get_comfy_dir, download_to_file, update_node_s
 from onnxruntime import InferenceSession
 from typing_extensions import override
 from comfy import utils
+import torch 
 
 
 sys.path.insert(0, os.path.join(
@@ -214,7 +215,14 @@ class WD14Tagger(io.ComfyNode):
         pbar = utils.ProgressBar(image.shape[0])
         tags = []
         for i in range(image.shape[0]):
-            img = Image.fromarray(np.array(image[i] * 255, dtype=np.uint8))
+            frame = image[i]
+            if isinstance(frame, torch.Tensor):
+                frame = frame.detach().cpu().numpy()
+            
+            frame = (frame * 255.0).clip(0, 255).astype(np.uint8)
+            if frame.ndim == 3 and frame.shape[2] == 4:
+                frame = frame[:, :, :3]
+            img = Image.fromarray(frame)
             (result, general_index, character_index) = wait_for_async(
                 lambda: tag(img, model, replace_underscore))
 

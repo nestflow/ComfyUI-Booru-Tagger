@@ -1,11 +1,11 @@
 from .pysssss import init
-from .nodes import WD14TaggerExtension
+from .nodes import BooruTaggerExtension
 
 WEB_DIRECTORY = "./web"
 
-async def comfy_entrypoint() -> WD14TaggerExtension:
+async def comfy_entrypoint() -> BooruTaggerExtension:
     if init(check_imports=["onnxruntime"]):
-        return WD14TaggerExtension()
+        return BooruTaggerExtension()
     else:
         exit(1)
 

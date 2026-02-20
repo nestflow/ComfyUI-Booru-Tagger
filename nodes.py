@@ -56,7 +56,7 @@ def get_installed_models():
     return models
 
 
-async def wd_tag(wd_model: InferenceSession, img: Image.Image):
+def wd_tag(wd_model: InferenceSession, img: Image.Image):
     img_input = wd_model.get_inputs()[0]
     (batch_size, height, width, channel) = img_input.shape
 
@@ -81,7 +81,7 @@ async def wd_tag(wd_model: InferenceSession, img: Image.Image):
     return result
 
 
-async def pixai_tag(pixai_model: InferenceSession, img):
+def pixai_tag(pixai_model: InferenceSession, img):
     img_input = pixai_model.get_inputs()[0]
     (batch_size, channel, height, width) = img_input.shape
 
@@ -113,7 +113,7 @@ async def pixai_tag(pixai_model: InferenceSession, img):
     return result
 
 
-async def camie_tag(camie_model: InferenceSession, img):
+def camie_tag(camie_model: InferenceSession, img):
     img_input = camie_model.get_inputs()[0]
     (batch_size, channel, height, width) = img_input.shape
 
@@ -242,11 +242,11 @@ class WD14Tagger(io.ComfyNode):
             model_name = tagger_info[1]
 
             if model_name.startswith("pixai-tagger"):
-                probs = wait_for_async(lambda: pixai_tag(tagger_model, img))
+                probs = pixai_tag(tagger_model, img)
             elif model_name.startswith("camie-tagger-v2"):
-                probs = wait_for_async(lambda: camie_tag(tagger_model, img))
+                probs = camie_tag(tagger_model, img)
             else:  # WD tagger
-                probs = wait_for_async(lambda: wd_tag(tagger_model, img))
+                probs = wd_tag(tagger_model, img)
 
             tags.append(get_tag(probs, tags_df, threshold,
                         character_threshold, trailing_comma, sort_tags, exclude_tags))
@@ -339,7 +339,7 @@ class UniqueTags(io.ComfyNode):
         return io.NodeOutput(unique_tags)
 
 
-class WD14TaggerExtension(ComfyExtension):
+class BooruTaggerExtension(ComfyExtension):
     @override
     async def get_node_list(self) -> list[type[io.ComfyNode]]:
         return [

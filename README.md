@@ -4,7 +4,9 @@
 
 1. Migrate to ComfyUI Node v3.
 2. Separate model loading and inference, much faster running! (No longer need to load models for each image input).
-3. Add support for [Pixai Tagger v0.9 (onnx model)](https://huggingface.co/deepghs/pixai-tagger-v0.9-onnx) and [Camie Tagger v2](https://huggingface.co/Camais03/camie-tagger-v2).
+3. **New model support**
+    - [Pixai Tagger v0.9 (onnx model)](https://huggingface.co/deepghs/pixai-tagger-v0.9-onnx)
+    - [Camie Tagger v2](https://huggingface.co/Camais03/camie-tagger-v2)
 
 A [ComfyUI](https://github.com/comfyanonymous/ComfyUI) extension allowing the interrogation of booru tags from images.
 

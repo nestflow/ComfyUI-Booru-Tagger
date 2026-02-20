@@ -54,7 +54,7 @@ def get_installed_models():
     return models
 
 
-async def tag(wd14_model, image):
+async def tag(wd14_model: InferenceSession, image):
     img_input = wd14_model.get_inputs()[0]
 
     model_type = 'pixai' if img_input.shape[1] == 3 else 'wd'
@@ -72,20 +72,20 @@ async def tag(wd14_model, image):
     square.paste(image, ((height-new_size[0])//2, (height-new_size[1])//2))
 
     image = np.array(square).astype(np.float32)
-    image = image[:, :, ::-1]  # RGB -> BGR
-
+    
     if model_type == 'pixai':
+        image = (image - np.mean(image, axis=(0, 1))) / np.std(image, axis=(0, 1)) * 0.5 + 0.5
+        # image = (image - np.mean(image)) / np.std(image) * 0.5 + 0.5
         image = np.transpose(image, (2, 0, 1))
+    else:
+        image = image[:, :, ::-1]  # RGB -> BGR
     
     image = np.expand_dims(image, 0) # Batch dim
     
     if model_type == 'pixai':
-        logit_name = wd14_model.get_outputs()[0].name
-        pred_name = wd14_model.get_outputs()[1].name
-        (logits, prediction) = wd14_model.run([logit_name, pred_name], {img_input.name: image})
-        print(logits)
-        print(prediction)
-        result = logits[0]
+        pred_name = wd14_model.get_outputs()[2].name
+        prediction = wd14_model.run([pred_name], {img_input.name: image})[0]
+        result = prediction[0]
     else:
         label_name = wd14_model.get_outputs()[0].name
         probs = wd14_model.run([label_name], {img_input.name: image})[0]
@@ -108,7 +108,6 @@ def get_tag(probs, wd14_tag_info: pd.DataFrame, threshold=0.35, character_thresh
     res = ("" if trailing_comma else ", ").join((tag.replace(
         "(", "\\(").replace(")", "\\)") + (", " if trailing_comma else "") for tag in tags))
     
-    print('Tags:', res)
     return res
 
 
@@ -243,22 +242,6 @@ class LoadWD14Model(io.ComfyNode):
         df = pd.read_csv(os.path.join(models_dir, model_name + ".csv"))
         if replace_underscore:
             df["name"] = df["name"].str.replace("_", " ")
-
-        # tags = []
-        # general_index = None
-        # character_index = None
-        # with open(os.path.join(models_dir, model_name + ".csv")) as f:
-        #     reader = csv.reader(f)
-        #     next(reader)
-        #     for row in reader:
-        #         if general_index is None and row[2] == "0":
-        #             general_index = reader.line_num - 2
-        #         elif character_index is None and row[2] == "4":
-        #             character_index = reader.line_num - 2
-        #         if replace_underscore:
-        #             tags.append(row[1].replace("_", " "))
-        #         else:
-        #             tags.append(row[1])
         
         return io.NodeOutput(model, df)
 

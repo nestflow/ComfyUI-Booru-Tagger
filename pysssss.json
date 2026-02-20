@@ -9,7 +9,9 @@
 		"ortProviders": ["CUDAExecutionProvider", "CPUExecutionProvider"],
 		"HF_ENDPOINT": "https://huggingface.co"
 	},
-	"models": {
+	"model_url": {
+		"pixai-tagger-v0.9": "{HF_ENDPOINT}/deepghs/pixai-tagger-v0.9-onnx",
+		"camie-tagger-v2": "{HF_ENDPOINT}/Camais03/camie-tagger-v2",
 		"wd-eva02-large-tagger-v3": "{HF_ENDPOINT}/SmilingWolf/wd-eva02-large-tagger-v3",
 		"wd-vit-tagger-v3": "{HF_ENDPOINT}/SmilingWolf/wd-vit-tagger-v3",
 		"wd-swinv2-tagger-v3": "{HF_ENDPOINT}/SmilingWolf/wd-swinv2-tagger-v3",
@@ -20,7 +22,12 @@
 		"wd-v1-4-convnext-tagger": "{HF_ENDPOINT}/SmilingWolf/wd-v1-4-convnext-tagger",
 		"wd-v1-4-vit-tagger-v2": "{HF_ENDPOINT}/SmilingWolf/wd-v1-4-vit-tagger-v2",
 		"wd-v1-4-swinv2-tagger-v2": "{HF_ENDPOINT}/SmilingWolf/wd-v1-4-swinv2-tagger-v2",
-		"wd-v1-4-vit-tagger": "{HF_ENDPOINT}/SmilingWolf/wd-v1-4-vit-tagger",
-		"pixai-tagger-v0.9": "{HF_ENDPOINT}/deepghs/pixai-tagger-v0.9-onnx"
+		"wd-v1-4-vit-tagger": "{HF_ENDPOINT}/SmilingWolf/wd-v1-4-vit-tagger"
+	},
+	"model_path": {
+		"camie-tagger-v2": "camie-tagger-v2.onnx"
+	},
+	"metadata_path": {
+		"camie-tagger-v2": "camie-tagger-v2-metadata.json"
 	}
 }

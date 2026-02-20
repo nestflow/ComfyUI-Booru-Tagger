@@ -1,6 +1,5 @@
 from comfy_api.latest import ComfyExtension, io
 import numpy as np
-import csv
 import asyncio
 import os
 import aiohttp
@@ -15,6 +14,9 @@ from onnxruntime import InferenceSession
 from typing_extensions import override
 from comfy import utils
 import pandas as pd
+import json
+import torchvision.transforms as transforms
+import torch
 
 sys.path.insert(0, os.path.join(
     os.path.dirname(os.path.realpath(__file__)), "comfy"))
@@ -39,7 +41,7 @@ if "wd14_tagger" in folder_paths.folder_names_and_paths:
         os.makedirs(models_dir)
 else:
     models_dir = get_ext_dir("models", mkdir=True)
-known_models = list(config["models"].keys())
+known_models = list(config["model_url"].keys())
 
 log("Available ORT providers: " +
     ", ".join(onnxruntime.get_available_providers()), "DEBUG", True)
@@ -49,54 +51,108 @@ log("Using ORT providers: " +
 
 def get_installed_models():
     models = filter(lambda x: x.endswith(".onnx"), os.listdir(models_dir))
-    models = [m for m in models if os.path.exists(
-        os.path.join(models_dir, os.path.splitext(m)[0] + ".csv"))]
+    # models = [m for m in models if os.path.exists(
+    #     os.path.join(models_dir, os.path.splitext(m)[0] + ".csv"))]
     return models
 
 
-async def tag(wd14_model: InferenceSession, image):
-    img_input = wd14_model.get_inputs()[0]
-
-    model_type = 'pixai' if img_input.shape[1] == 3 else 'wd'
-
-    if model_type == 'pixai':
-        (batch_size, channel, height, width) = img_input.shape
-    else:
-        (batch_size, height, width, channel) = img_input.shape
+async def wd_tag(wd_model: InferenceSession, img: Image.Image):
+    img_input = wd_model.get_inputs()[0]
+    (batch_size, height, width, channel) = img_input.shape
 
     # Reduce to max size and pad with white
-    ratio = float(height)/max(image.size)
-    new_size = tuple([int(x*ratio) for x in image.size])
-    image = image.resize(new_size, Image.Resampling.LANCZOS)
-    square = Image.new("RGB", (height, height), (255, 255, 255))
-    square.paste(image, ((height-new_size[0])//2, (height-new_size[1])//2))
+    ratio = float(height)/max(img.size)
+    new_size = tuple([int(x*ratio) for x in img.size])
+    img = img.resize(new_size, Image.Resampling.LANCZOS)
+    pad_color = (255, 255, 255)
+    new_img = Image.new("RGB", (height, height), pad_color)
+    paste_x = (height-new_size[0]) // 2
+    paste_y = (height-new_size[1]) // 2
+    new_img.paste(img, (paste_x, paste_y))
 
-    image = np.array(square).astype(np.float32)
-    
-    if model_type == 'pixai':
-        image = (image - np.mean(image, axis=(0, 1))) / np.std(image, axis=(0, 1)) * 0.5 + 0.5
-        # image = (image - np.mean(image)) / np.std(image) * 0.5 + 0.5
-        image = np.transpose(image, (2, 0, 1))
-    else:
-        image = image[:, :, ::-1]  # RGB -> BGR
-    
-    image = np.expand_dims(image, 0) # Batch dim
-    
-    if model_type == 'pixai':
-        pred_name = wd14_model.get_outputs()[2].name
-        prediction = wd14_model.run([pred_name], {img_input.name: image})[0]
-        result = prediction[0]
-    else:
-        label_name = wd14_model.get_outputs()[0].name
-        probs = wd14_model.run([label_name], {img_input.name: image})[0]
-        result = probs[0]
-    
+    img_numpy = np.array(new_img, dtype=np.float32)
+    img_numpy = img_numpy[:, :, ::-1]  # RGB -> BGR
+    img_numpy = np.expand_dims(img_numpy, 0)  # Batch dim
+
+    label_name = wd_model.get_outputs()[0].name
+    probs = wd_model.run([label_name], {img_input.name: img_numpy})[0]
+    result = probs[0]
+
     return result
 
 
-def get_tag(probs, wd14_tag_info: pd.DataFrame, threshold=0.35, character_threshold=0.85, trailing_comma=False, exclude_tags=""):
-    df = wd14_tag_info.copy()
-    df['probs'] = probs
+async def pixai_tag(pixai_model: InferenceSession, img):
+    img_input = pixai_model.get_inputs()[0]
+    (batch_size, channel, height, width) = img_input.shape
+
+    # Reduce to max size and pad with white
+    ratio = float(height)/max(img.size)
+    new_size = tuple([int(x*ratio) for x in img.size])
+    img = img.resize(new_size, Image.Resampling.LANCZOS)
+
+    pad_color = (128, 128, 128)
+    new_img = Image.new("RGB", (height, height), pad_color)
+    paste_x = (height-new_size[0]) // 2
+    paste_y = (height-new_size[1]) // 2
+    new_img.paste(img, (paste_x, paste_y))
+
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(
+            mean=[0.5, 0.5, 0.5],
+            std=[0.5, 0.5, 0.5]
+        )
+    ])
+
+    img_tensor = transform(new_img)
+    img_numpy = torch.unsqueeze(img_tensor, 0).numpy()
+
+    pred_name = pixai_model.get_outputs()[2].name
+    prediction = pixai_model.run([pred_name], {img_input.name: img_numpy})[0]
+    result = prediction[0]
+    return result
+
+
+async def camie_tag(camie_model: InferenceSession, img):
+    img_input = camie_model.get_inputs()[0]
+    (batch_size, channel, height, width) = img_input.shape
+
+    # Reduce to max size and pad with white
+    ratio = float(height)/max(img.size)
+    new_size = tuple([int(x*ratio) for x in img.size])
+
+    pad_color = (124, 116, 104)
+    new_img = Image.new("RGB", (height, height), pad_color)
+    paste_x = (height-new_size[0]) // 2
+    paste_y = (height-new_size[1]) // 2
+    new_img.paste(img, (paste_x, paste_y))
+
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(
+            mean=[0.485, 0.456, 0.406],
+            std=[0.229, 0.224, 0.225]
+        )
+    ])
+
+    img_tensor = transform(new_img)
+    img_numpy = torch.unsqueeze(img_tensor, 0).numpy()
+
+    init_pred_name = camie_model.get_outputs()[0].name
+    refine_pred_name = camie_model.get_outputs()[1].name
+    select_cand_name = camie_model.get_outputs()[2].name
+    (init_logits, ref_logits, select_cands) = camie_model.run(
+        [init_pred_name, refine_pred_name, select_cand_name], {img_input.name: img_numpy})
+
+    probs = 1.0 / (1.0 + np.exp(-ref_logits))
+    result = probs[0]
+    return result
+
+
+def get_tag(probs, tags_df: pd.DataFrame, threshold=0.35, character_threshold=0.85, trailing_comma=False, sort_tags=False, exclude_tags=""):
+    df = tags_df.assign(probs=probs)
+    if sort_tags:
+        df = df.sort_values(by='probs', ascending=False)
 
     general = df[(df['category'] == 0) & (df['probs'] > threshold)]['name'].to_list()
     character = df[(df['category'] == 4) & (df['probs'] > character_threshold)]['name'].to_list()
@@ -107,7 +163,7 @@ def get_tag(probs, wd14_tag_info: pd.DataFrame, threshold=0.35, character_thresh
 
     res = ("" if trailing_comma else ", ").join((tag.replace(
         "(", "\\(").replace(")", "\\)") + (", " if trailing_comma else "") for tag in tags))
-    
+
     return res
 
 
@@ -118,9 +174,13 @@ async def download_model(model, client_id, node):
     if hf_endpoint.endswith("/"):
         hf_endpoint = hf_endpoint.rstrip("/")
 
-    url = config["models"][model]
+    url = config["model_url"][model]
     url = url.replace("{HF_ENDPOINT}", hf_endpoint)
-    url = f"{url}/resolve/main/"
+    url = f"{url}/resolve/main"
+
+    model_path = config["model_path"].get(model, "model.onnx")
+    metadata_path = config["metadata_path"].get(model, "selected_tags.csv")
+
     async with aiohttp.ClientSession(loop=asyncio.get_event_loop()) as session:
         async def update_callback(perc):
             nonlocal client_id
@@ -131,9 +191,12 @@ async def download_model(model, client_id, node):
 
         try:
             await download_to_file(
-                f"{url}model.onnx", os.path.join(models_dir, f"{model}.onnx"), update_callback, session=session)
+                f"{url}/{model_path}", os.path.join(models_dir, f"{model}.onnx"), update_callback, session=session)
+
+            ext = metadata_path.split('.')[-1]
             await download_to_file(
-                f"{url}selected_tags.csv", os.path.join(models_dir, f"{model}.csv"), update_callback, session=session)
+                f"{url}/{metadata_path}", os.path.join(models_dir, f"{model}.{ext}"), update_callback, session=session)
+
         except aiohttp.ClientConnectorError as err:
             log("Unable to download model. Download files manually or try using a HF mirror/proxy website by setting the environment variable HF_ENDPOINT=https://.....", "ERROR", True)
             raise
@@ -143,34 +206,6 @@ async def download_model(model, client_id, node):
     return web.Response(status=200)
 
 
-@PromptServer.instance.routes.get("/pysssss/wd14tagger/tag")
-async def get_tags(request):
-    if "filename" not in request.rel_url.query:
-        return web.Response(status=404)
-
-    type = request.query.get("type", "output")
-    if type not in ["output", "input", "temp"]:
-        return web.Response(status=400)
-
-    target_dir = get_comfy_dir(type)
-    image_path = os.path.abspath(os.path.join(
-        target_dir, request.query.get("subfolder", ""), request.query["filename"]))
-
-    if os.path.commonpath((image_path, target_dir)) != target_dir:
-        return web.Response(status=403)
-
-    if not os.path.isfile(image_path):
-        return web.Response(status=404)
-
-    image = Image.open(image_path)
-
-    models = get_installed_models()
-    default = defaults["model"] + ".onnx"
-    model = default if default in models else models[0]
-
-    return web.json_response(await tag(image, model, client_id=request.rel_url.query.get("clientId", ""), node=request.rel_url.query.get("node", "")))
-
-
 class WD14Tagger(io.ComfyNode):
     @classmethod
     def define_schema(cls) -> io.Schema:
@@ -178,8 +213,8 @@ class WD14Tagger(io.ComfyNode):
             node_id="WD14Tagger",
             category="image",
             inputs=[
-                io.Custom("WD14_MODEL").Input("wd14_model"),
-                io.Custom("WD14_TAG_INFO").Input("wd14_tag_info"),
+                io.Custom("TAGGER_MODEL").Input("tagger_model"),
+                io.Custom("TAGGER_INFO").Input("tagger_info"),
                 io.Image.Input("image"),
                 io.Float.Input("threshold", min=0.0, max=1.0,
                                step=0.05, default=defaults["threshold"]),
@@ -187,6 +222,7 @@ class WD14Tagger(io.ComfyNode):
                                min=0.0, max=1.0, step=0.05, default=defaults["character_threshold"]),
                 io.Boolean.Input("trailing_comma",
                                  default=defaults["trailing_comma"]),
+                io.Boolean.Input("sort_tags", default=False),
                 io.String.Input(
                     "exclude_tags", default=defaults["exclude_tags"], multiline=True),
             ],
@@ -196,33 +232,46 @@ class WD14Tagger(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, wd14_model, wd14_tag_info, image, threshold, character_threshold, trailing_comma=False, exclude_tags="") -> io.NodeOutput:
+    def execute(cls, tagger_model, tagger_info, image, threshold, character_threshold, trailing_comma=False, sort_tags=False, exclude_tags="") -> io.NodeOutput:
         pbar = utils.ProgressBar(image.shape[0])
         tags = []
         for i in range(image.shape[0]):
             img = Image.fromarray(np.array(image[i] * 255, dtype=np.uint8))
-            probs = wait_for_async(lambda: tag(wd14_model, img))
 
-            tags.append(get_tag(probs, wd14_tag_info, threshold, character_threshold, trailing_comma, exclude_tags))
+            tags_df = tagger_info[0]
+            model_name = tagger_info[1]
+
+            if model_name.startswith("pixai-tagger"):
+                probs = wait_for_async(lambda: pixai_tag(tagger_model, img))
+            elif model_name.startswith("camie-tagger-v2"):
+                probs = wait_for_async(lambda: camie_tag(tagger_model, img))
+            else:  # WD tagger
+                probs = wait_for_async(lambda: wd_tag(tagger_model, img))
+
+            tags.append(get_tag(probs, tags_df, threshold,
+                        character_threshold, trailing_comma, sort_tags, exclude_tags))
             pbar.update(1)
         return io.NodeOutput(tags)
 
-class LoadWD14Model(io.ComfyNode):
+
+class LoadTaggerModel(io.ComfyNode):
     @classmethod
     def define_schema(cls) -> io.Schema:
         extra = [name for name, _ in (os.path.splitext(
             m) for m in get_installed_models()) if name not in known_models]
         models = known_models + extra
         return io.Schema(
-            node_id="LoadWD14Model",
+            node_id="LoadTaggerModel",
             category="model",
             inputs=[
-                io.Combo.Input("model_name", options=models, default=defaults["model"]),
-                io.Boolean.Input("replace_underscore", default=defaults["replace_underscore"]),
+                io.Combo.Input("model_name", options=models,
+                               default=defaults["model"]),
+                io.Boolean.Input("replace_underscore",
+                                 default=defaults["replace_underscore"]),
             ],
             outputs=[
-                io.Custom("WD14_MODEL").Output("wd14_model"),
-                io.Custom("WD14_TAG_INFO").Output("wd14_tag_info")
+                io.Custom("TAGGER_MODEL").Output("tagger_model"),
+                io.Custom("TAGGER_INFO").Output("tagger_info")
             ]
         )
 
@@ -238,12 +287,31 @@ class LoadWD14Model(io.ComfyNode):
         name = os.path.join(models_dir, model_name + ".onnx")
         model = InferenceSession(name, providers=defaults["ortProviders"])
 
-        # Read all tags from csv and locate start of each category
-        df = pd.read_csv(os.path.join(models_dir, model_name + ".csv"))
-        if replace_underscore:
-            df["name"] = df["name"].str.replace("_", " ")
-        
-        return io.NodeOutput(model, df)
+        csv_path = os.path.join(models_dir, model_name + ".csv")
+        json_path = os.path.join(models_dir, model_name + ".json")
+        if (model_name.startswith("wd") or model_name.startswith("pixai")) and os.path.exists(csv_path):
+            df = pd.read_csv(csv_path)
+            if replace_underscore:
+                df["name"] = df["name"].str.replace("_", " ")
+            return io.NodeOutput(model, (df, model_name))
+        elif model_name.startswith("camie") and os.path.exists(json_path):
+            df = pd.DataFrame()
+            with open(json_path) as f:
+                js = json.load(f)
+                tag_mapping = js["dataset_info"]["tag_mapping"]
+                df["name"] = list(tag_mapping["idx_to_tag"].values())
+                df["category_name"] = list(
+                    tag_mapping["tag_to_category"].values())
+                category_to_idx = {value: index for index, value in enumerate(
+                    js["dataset_info"]["categories"])}
+                df["category"] = df["category_name"].replace(category_to_idx)
+            if replace_underscore:
+                df["name"] = df["name"].str.replace("_", " ")
+            return io.NodeOutput(model, (df, model_name))
+        else:
+            log("No tag data is found.")
+            exit(1)
+
 
 class UniqueTags(io.ComfyNode):
     @classmethod
@@ -266,7 +334,7 @@ class UniqueTags(io.ComfyNode):
             tag = tag.strip()
             if len(tag) > 0 and tag not in unique_tags:
                 unique_tags.append(tag)
-        
+
         unique_tags = ', '.join(unique_tags)
         return io.NodeOutput(unique_tags)
 
@@ -275,7 +343,7 @@ class WD14TaggerExtension(ComfyExtension):
     @override
     async def get_node_list(self) -> list[type[io.ComfyNode]]:
         return [
-            LoadWD14Model,
+            LoadTaggerModel,
             WD14Tagger,
             UniqueTags
         ]

@@ -14,7 +14,7 @@ from .pysssss import get_ext_dir, get_comfy_dir, download_to_file, update_node_s
 from onnxruntime import InferenceSession
 from typing_extensions import override
 from comfy import utils
-
+import pandas as pd
 
 sys.path.insert(0, os.path.join(
     os.path.dirname(os.path.realpath(__file__)), "comfy"))
@@ -22,10 +22,10 @@ sys.path.insert(0, os.path.join(
 config = get_extension_config()
 
 defaults = {
-    "model": "wd-v1-4-moat-tagger-v2",
+    "model": "wd-eva02-large-tagger-v3",
     "threshold": 0.35,
     "character_threshold": 0.85,
-    "replace_underscore": False,
+    "replace_underscore": True,
     "trailing_comma": False,
     "exclude_tags": "",
     "ortProviders": ["CUDAExecutionProvider", "CPUExecutionProvider"],
@@ -54,18 +54,15 @@ def get_installed_models():
     return models
 
 
-async def tag(image, model_name, replace_underscore=True, client_id=None, node=None):
-    if model_name.endswith(".onnx"):
-        model_name = model_name[0:-5]
-    installed = list(get_installed_models())
-    if not any(model_name + ".onnx" in s for s in installed):
-        await download_model(model_name, client_id, node)
+async def tag(wd14_model, image):
+    img_input = wd14_model.get_inputs()[0]
 
-    name = os.path.join(models_dir, model_name + ".onnx")
-    model = InferenceSession(name, providers=defaults["ortProviders"])
+    model_type = 'pixai' if img_input.shape[1] == 3 else 'wd'
 
-    input = model.get_inputs()[0]
-    height = input.shape[1]
+    if model_type == 'pixai':
+        (batch_size, channel, height, width) = img_input.shape
+    else:
+        (batch_size, height, width, channel) = img_input.shape
 
     # Reduce to max size and pad with white
     ratio = float(height)/max(image.size)
@@ -76,47 +73,42 @@ async def tag(image, model_name, replace_underscore=True, client_id=None, node=N
 
     image = np.array(square).astype(np.float32)
     image = image[:, :, ::-1]  # RGB -> BGR
-    image = np.expand_dims(image, 0)
 
-    # Read all tags from csv and locate start of each category
-    tags = []
-    general_index = None
-    character_index = None
-    with open(os.path.join(models_dir, model_name + ".csv")) as f:
-        reader = csv.reader(f)
-        next(reader)
-        for row in reader:
-            if general_index is None and row[2] == "0":
-                general_index = reader.line_num - 2
-            elif character_index is None and row[2] == "4":
-                character_index = reader.line_num - 2
-            if replace_underscore:
-                tags.append(row[1].replace("_", " "))
-            else:
-                tags.append(row[1])
-
-    label_name = model.get_outputs()[0].name
-    probs = model.run([label_name], {input.name: image})[0]
-
-    result = list(zip(tags, probs[0]))
-    return (result, general_index, character_index)
+    if model_type == 'pixai':
+        image = np.transpose(image, (2, 0, 1))
+    
+    image = np.expand_dims(image, 0) # Batch dim
+    
+    if model_type == 'pixai':
+        logit_name = wd14_model.get_outputs()[0].name
+        pred_name = wd14_model.get_outputs()[1].name
+        (logits, prediction) = wd14_model.run([logit_name, pred_name], {img_input.name: image})
+        print(logits)
+        print(prediction)
+        result = logits[0]
+    else:
+        label_name = wd14_model.get_outputs()[0].name
+        probs = wd14_model.run([label_name], {img_input.name: image})[0]
+        result = probs[0]
+    
+    return result
 
 
-def get_tag(result, general_index, character_index, threshold=0.35, character_threshold=0.85, trailing_comma=False, exclude_tags=""):
-    # rating = max(result[:general_index], key=lambda x: x[1])
-    general = [item for item in result[general_index:character_index]
-               if item[1] > threshold]
-    character = [item for item in result[character_index:]
-                 if item[1] > character_threshold]
+def get_tag(probs, wd14_tag_info: pd.DataFrame, threshold=0.35, character_threshold=0.85, trailing_comma=False, exclude_tags=""):
+    df = wd14_tag_info.copy()
+    df['probs'] = probs
 
-    all = character + general
+    general = df[(df['category'] == 0) & (df['probs'] > threshold)]['name'].to_list()
+    character = df[(df['category'] == 4) & (df['probs'] > character_threshold)]['name'].to_list()
+    tags = character + general
+
     remove = [s.strip() for s in exclude_tags.lower().split(",")]
-    all = [tag for tag in all if tag[0] not in remove]
+    tags = [tag for tag in tags if tag not in remove]
 
-    res = ("" if trailing_comma else ", ").join((item[0].replace(
-        "(", "\\(").replace(")", "\\)") + (", " if trailing_comma else "") for item in all))
-
-    print(res)
+    res = ("" if trailing_comma else ", ").join((tag.replace(
+        "(", "\\(").replace(")", "\\)") + (", " if trailing_comma else "") for tag in tags))
+    
+    print('Tags:', res)
     return res
 
 
@@ -183,26 +175,21 @@ async def get_tags(request):
 class WD14Tagger(io.ComfyNode):
     @classmethod
     def define_schema(cls) -> io.Schema:
-        extra = [name for name, _ in (os.path.splitext(
-            m) for m in get_installed_models()) if name not in known_models]
-        models = known_models + extra
         return io.Schema(
             node_id="WD14Tagger",
             category="image",
             inputs=[
+                io.Custom("WD14_MODEL").Input("wd14_model"),
+                io.Custom("WD14_TAG_INFO").Input("wd14_tag_info"),
                 io.Image.Input("image"),
-                io.Combo.Input("model", options=models,
-                               default=defaults["model"]),
                 io.Float.Input("threshold", min=0.0, max=1.0,
                                step=0.05, default=defaults["threshold"]),
                 io.Float.Input("character_threshold",
                                min=0.0, max=1.0, step=0.05, default=defaults["character_threshold"]),
-                io.Boolean.Input("replace_underscore",
-                                 default=defaults["replace_underscore"]),
                 io.Boolean.Input("trailing_comma",
                                  default=defaults["trailing_comma"]),
                 io.String.Input(
-                    "exclude_tags", default=defaults["exclude_tags"], multiline=True)
+                    "exclude_tags", default=defaults["exclude_tags"], multiline=True),
             ],
             outputs=[
                 io.String.Output("tags", is_output_list=True),
@@ -210,18 +197,70 @@ class WD14Tagger(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, image, model, threshold, character_threshold, replace_underscore=False, trailing_comma=False, exclude_tags="") -> io.NodeOutput:
+    def execute(cls, wd14_model, wd14_tag_info, image, threshold, character_threshold, trailing_comma=False, exclude_tags="") -> io.NodeOutput:
         pbar = utils.ProgressBar(image.shape[0])
         tags = []
         for i in range(image.shape[0]):
             img = Image.fromarray(np.array(image[i] * 255, dtype=np.uint8))
-            (result, general_index, character_index) = wait_for_async(
-                lambda: tag(img, model, replace_underscore))
+            probs = wait_for_async(lambda: tag(wd14_model, img))
 
-            tags.append(get_tag(result, general_index, character_index,
-                        threshold, character_threshold, trailing_comma, exclude_tags))
+            tags.append(get_tag(probs, wd14_tag_info, threshold, character_threshold, trailing_comma, exclude_tags))
             pbar.update(1)
         return io.NodeOutput(tags)
+
+class LoadWD14Model(io.ComfyNode):
+    @classmethod
+    def define_schema(cls) -> io.Schema:
+        extra = [name for name, _ in (os.path.splitext(
+            m) for m in get_installed_models()) if name not in known_models]
+        models = known_models + extra
+        return io.Schema(
+            node_id="LoadWD14Model",
+            category="model",
+            inputs=[
+                io.Combo.Input("model_name", options=models, default=defaults["model"]),
+                io.Boolean.Input("replace_underscore", default=defaults["replace_underscore"]),
+            ],
+            outputs=[
+                io.Custom("WD14_MODEL").Output("wd14_model"),
+                io.Custom("WD14_TAG_INFO").Output("wd14_tag_info")
+            ]
+        )
+
+    @classmethod
+    async def execute(cls, model_name, replace_underscore, client_id=None, node=None) -> io.NodeOutput:
+        # Load model
+        if model_name.endswith(".onnx"):
+            model_name = model_name[0:-5]
+        installed = list(get_installed_models())
+        if not any(model_name + ".onnx" in s for s in installed):
+            await download_model(model_name, client_id, node)
+
+        name = os.path.join(models_dir, model_name + ".onnx")
+        model = InferenceSession(name, providers=defaults["ortProviders"])
+
+        # Read all tags from csv and locate start of each category
+        df = pd.read_csv(os.path.join(models_dir, model_name + ".csv"))
+        if replace_underscore:
+            df["name"] = df["name"].str.replace("_", " ")
+
+        # tags = []
+        # general_index = None
+        # character_index = None
+        # with open(os.path.join(models_dir, model_name + ".csv")) as f:
+        #     reader = csv.reader(f)
+        #     next(reader)
+        #     for row in reader:
+        #         if general_index is None and row[2] == "0":
+        #             general_index = reader.line_num - 2
+        #         elif character_index is None and row[2] == "4":
+        #             character_index = reader.line_num - 2
+        #         if replace_underscore:
+        #             tags.append(row[1].replace("_", " "))
+        #         else:
+        #             tags.append(row[1])
+        
+        return io.NodeOutput(model, df)
 
 class UniqueTags(io.ComfyNode):
     @classmethod
@@ -253,6 +292,7 @@ class WD14TaggerExtension(ComfyExtension):
     @override
     async def get_node_list(self) -> list[type[io.ComfyNode]]:
         return [
+            LoadWD14Model,
             WD14Tagger,
             UniqueTags
         ]

@@ -21,6 +21,6 @@
 		"wd-v1-4-vit-tagger-v2": "{HF_ENDPOINT}/SmilingWolf/wd-v1-4-vit-tagger-v2",
 		"wd-v1-4-swinv2-tagger-v2": "{HF_ENDPOINT}/SmilingWolf/wd-v1-4-swinv2-tagger-v2",
 		"wd-v1-4-vit-tagger": "{HF_ENDPOINT}/SmilingWolf/wd-v1-4-vit-tagger",
-		"cl-tagger-1-02": "{HF_ENDPOINT}/cella110n/cl_tagger/cl_tagger_1_02"
+		"pixai-tagger-v0.9": "{HF_ENDPOINT}/deepghs/pixai-tagger-v0.9-onnx"
 	}
 }

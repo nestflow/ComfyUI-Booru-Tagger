@@ -1,7 +1,7 @@
-from .pysssss import init
+from .utils import init
 from .nodes import BooruTaggerExtension
 
-WEB_DIRECTORY = "./web"
+# WEB_DIRECTORY = "./web"
 
 async def comfy_entrypoint() -> BooruTaggerExtension:
     if init(check_imports=["onnxruntime"]):

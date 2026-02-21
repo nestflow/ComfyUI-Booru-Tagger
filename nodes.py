@@ -118,6 +118,7 @@ def camie_tag(camie_model: InferenceSession, img):
     # Reduce to max size and pad with white
     ratio = float(height)/max(img.size)
     new_size = tuple([int(x*ratio) for x in img.size])
+    img = img.resize(new_size, Image.Resampling.LANCZOS)
 
     pad_color = (124, 116, 104)
     new_img = Image.new("RGB", (height, height), pad_color)

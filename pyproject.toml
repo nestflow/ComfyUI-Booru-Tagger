@@ -3,7 +3,7 @@ name = "comfyui-booru-tagger"
 description = "A ComfyUI extension allowing the interrogation of booru tags from images."
 version = "1.0"
 license = { file = "LICENSE" }
-dependencies = ["onnxruntime"]
+dependencies = ["onnxruntime", "pandas"]
 
 [project.urls]
 Repository = "https://github.com/nestflow/ComfyUI-Booru-Tagger"

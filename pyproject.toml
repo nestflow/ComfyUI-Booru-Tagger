@@ -6,7 +6,7 @@ license = { file = "LICENSE" }
 dependencies = ["onnxruntime"]
 
 [project.urls]
-Repository = "https://github.com/nestflow/ComfyUI-WD14-Tagger"
+Repository = "https://github.com/nestflow/ComfyUI-Booru-Tagger"
 
 [tool.comfy]
 PublisherId = "nestflow"

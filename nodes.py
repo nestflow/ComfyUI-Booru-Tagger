@@ -208,7 +208,7 @@ class BooruTagger(io.ComfyNode):
     @classmethod
     def define_schema(cls) -> io.Schema:
         return io.Schema(
-            node_id="BooruTagger",
+            node_id="Booru Tagger",
             category="image",
             inputs=[
                 io.Custom("TAGGER_MODEL").Input("tagger_model"),
@@ -252,14 +252,14 @@ class BooruTagger(io.ComfyNode):
         return io.NodeOutput(tags)
 
 
-class LoadTaggerModel(io.ComfyNode):
+class LoadBooruTaggerModel(io.ComfyNode):
     @classmethod
     def define_schema(cls) -> io.Schema:
         extra = [name for name, _ in (os.path.splitext(
             m) for m in get_installed_models()) if name not in known_models]
         models = known_models + extra
         return io.Schema(
-            node_id="LoadTaggerModel",
+            node_id="Load Booru Tagger",
             category="model",
             inputs=[
                 io.Combo.Input("model_name", options=models,
@@ -269,7 +269,9 @@ class LoadTaggerModel(io.ComfyNode):
             ],
             outputs=[
                 io.Custom("TAGGER_MODEL").Output("tagger_model"),
-                io.Custom("TAGGER_INFO").Output("tagger_info")
+                io.Custom("TAGGER_INFO").Output("tagger_info"),
+                io.Float.Output("threshold"),
+                io.Float.Output("character_threshold")
             ]
         )
 
@@ -285,13 +287,16 @@ class LoadTaggerModel(io.ComfyNode):
         name = os.path.join(models_dir, model_name + ".onnx")
         model = InferenceSession(name, providers=defaults["ortProviders"])
 
+        threshold = config["threshold"].get(model_name, defaults["threshold"])
+        character_threshold = config["character_threshold"].get(model_name, defaults["character_threshold"])
+
         csv_path = os.path.join(models_dir, model_name + ".csv")
         json_path = os.path.join(models_dir, model_name + ".json")
         if (model_name.startswith("wd") or model_name.startswith("pixai")) and os.path.exists(csv_path):
             df = pd.read_csv(csv_path)
             if replace_underscore:
                 df["name"] = df["name"].str.replace("_", " ")
-            return io.NodeOutput(model, (df, model_name))
+            return io.NodeOutput(model, (df, model_name), threshold, character_threshold)
         elif model_name.startswith("camie") and os.path.exists(json_path):
             df = pd.DataFrame()
             with open(json_path) as f:
@@ -305,7 +310,7 @@ class LoadTaggerModel(io.ComfyNode):
                 df["category"] = df["category_name"].replace(category_to_idx)
             if replace_underscore:
                 df["name"] = df["name"].str.replace("_", " ")
-            return io.NodeOutput(model, (df, model_name))
+            return io.NodeOutput(model, (df, model_name), threshold, character_threshold)
         else:
             log("No tag data is found.")
             exit(1)
@@ -315,7 +320,7 @@ class UniqueTags(io.ComfyNode):
     @classmethod
     def define_schema(cls) -> io.Schema:
         return io.Schema(
-            node_id="UniqueTags",
+            node_id="Unique Tags",
             category="text",
             inputs=[
                 io.String.Input("input_tags")
@@ -341,7 +346,7 @@ class BooruTaggerExtension(ComfyExtension):
     @override
     async def get_node_list(self) -> list[type[io.ComfyNode]]:
         return [
-            LoadTaggerModel,
+            LoadBooruTaggerModel,
             BooruTagger,
             UniqueTags
         ]

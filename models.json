@@ -29,5 +29,13 @@
 	},
 	"metadata_path": {
 		"camie-tagger-v2": "camie-tagger-v2-metadata.json"
+	},
+	"threshold":{
+		"pixai-tagger-v0.9": 0.3,
+		"camie-tagger-v2": 0.492
+	},
+	"character_threshold":{
+		"pixai-tagger-v0.9": 0.85,
+		"camie-tagger-v2": 0.492
 	}
 }

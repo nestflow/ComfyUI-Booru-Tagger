@@ -6,10 +6,10 @@ import aiohttp
 import folder_paths
 import sys
 import onnxruntime
-from server import PromptServer
+# from server import PromptServer
 from aiohttp import web
 from PIL import Image
-from .pysssss import get_ext_dir, get_comfy_dir, download_to_file, update_node_status, wait_for_async, get_extension_config, log
+from .utils import get_ext_dir, download_to_file, get_extension_config, log
 from onnxruntime import InferenceSession
 from typing_extensions import override
 from comfy import utils
@@ -51,8 +51,6 @@ log("Using ORT providers: " +
 
 def get_installed_models():
     models = filter(lambda x: x.endswith(".onnx"), os.listdir(models_dir))
-    # models = [m for m in models if os.path.exists(
-    #     os.path.join(models_dir, os.path.splitext(m)[0] + ".csv"))]
     return models
 
 
@@ -184,10 +182,10 @@ async def download_model(model, client_id, node):
     async with aiohttp.ClientSession(loop=asyncio.get_event_loop()) as session:
         async def update_callback(perc):
             nonlocal client_id
-            message = ""
-            if perc < 100:
-                message = f"Downloading {model}"
-            update_node_status(client_id, node, message, perc)
+            # message = ""
+            # if perc < 100:
+            #     message = f"Downloading {model}"
+            # update_node_status(client_id, node, message, perc)
 
         try:
             await download_to_file(
@@ -201,16 +199,16 @@ async def download_model(model, client_id, node):
             log("Unable to download model. Download files manually or try using a HF mirror/proxy website by setting the environment variable HF_ENDPOINT=https://.....", "ERROR", True)
             raise
 
-        update_node_status(client_id, node, None)
+        # update_node_status(client_id, node, None)
 
     return web.Response(status=200)
 
 
-class WD14Tagger(io.ComfyNode):
+class BooruTagger(io.ComfyNode):
     @classmethod
     def define_schema(cls) -> io.Schema:
         return io.Schema(
-            node_id="WD14Tagger",
+            node_id="BooruTagger",
             category="image",
             inputs=[
                 io.Custom("TAGGER_MODEL").Input("tagger_model"),
@@ -344,6 +342,6 @@ class BooruTaggerExtension(ComfyExtension):
     async def get_node_list(self) -> list[type[io.ComfyNode]]:
         return [
             LoadTaggerModel,
-            WD14Tagger,
+            BooruTagger,
             UniqueTags
         ]

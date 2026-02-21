@@ -1,5 +1,5 @@
 {
-	"name": "WD14Tagger",
+	"name": "BooruTagger",
 	"logging": false,
 	"settings": {
 		"model": "wd-v1-4-moat-tagger-v2",

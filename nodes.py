@@ -51,12 +51,18 @@ defaults["ortProviders"] = [p for p in _ORT_PRIORITY if p in available_providers
 if not defaults["ortProviders"]:
     defaults["ortProviders"] = ["CPUExecutionProvider"]
 
-if "wd14_tagger" in folder_paths.folder_names_and_paths:
-    models_dir = folder_paths.get_folder_paths("wd14_tagger")[0]
-    if not os.path.exists(models_dir):
-        os.makedirs(models_dir)
-else:
-    models_dir = get_ext_dir("models", mkdir=True)
+folder_name = "booru_tagger"
+target_folder_path = os.path.join(folder_paths.models_dir, folder_name)
+if not os.path.exists(target_folder_path):
+    os.makedirs(target_folder_path, exist_ok=True)
+folder_paths.add_model_folder_path(folder_name, target_folder_path)
+models_dir = folder_paths.get_folder_paths(folder_name)[0]
+
+# Directories where legacy flat files may exist (v1.x used "wd14_tagger" or extension-local "models")
+_LEGACY_MODEL_DIRS = [
+    os.path.join(folder_paths.models_dir, "wd14_tagger"),
+    get_ext_dir("models"),
+]
 known_models = list(config["model_url"].keys())
 
 log("Available ORT providers: " +
@@ -64,26 +70,43 @@ log("Available ORT providers: " +
 log("Using ORT providers: " +
     ", ".join(defaults["ortProviders"]), "DEBUG", True)
 
+def _migrate_legacy_model(model_name, dest_model, dest_meta):
+    """Move legacy flat files into the nested directory structure (v1.x → v2.x).
 
-def get_installed_models():
-    models = filter(lambda x: x.endswith(".onnx"), os.listdir(models_dir))
-    return models
+    Before v2.x, files were stored flat in one of:
+      - ComfyUI/models/wd14_tagger/<model>.onnx
+      - <extension>/models/<model>.onnx
 
+    After v2.x, files are stored nested:
+      - ComfyUI/models/booru_tagger/<model>/model.onnx
+    """
+    if os.path.exists(dest_model) and os.path.exists(dest_meta):
+        return  # Already migrated or downloaded fresh
 
-def prepare_external_data_file(model):
-    """Alias the versioned download to the filename embedded in the ONNX file."""
-    if model not in config.get("external_data_path", {}):
+    # Scan all possible legacy locations
+    for legacy_dir in _LEGACY_MODEL_DIRS:
+        if not os.path.isdir(legacy_dir):
+            continue
+        legacy_model = os.path.join(legacy_dir, model_name + ".onnx")
+        if not os.path.exists(legacy_model):
+            continue
+
+        legacy_csv = os.path.join(legacy_dir, model_name + ".csv")
+        legacy_json = os.path.join(legacy_dir, model_name + ".json")
+
+        os.makedirs(os.path.dirname(dest_model), exist_ok=True)
+        if not os.path.exists(dest_model):
+            os.rename(legacy_model, dest_model)
+
+        for legacy_meta in (legacy_csv, legacy_json):
+            if os.path.exists(legacy_meta):
+                os.makedirs(os.path.dirname(dest_meta), exist_ok=True)
+                if not os.path.exists(dest_meta):
+                    os.rename(legacy_meta, dest_meta)
+                break
+
+        log(f"Migrated legacy files for {model_name} from {legacy_dir} to nested layout", "INFO", True)
         return
-
-    source = os.path.join(models_dir, model + ".onnx.data")
-    alias = os.path.join(models_dir, "model.onnx.data")
-    if os.path.exists(alias):
-        if os.path.samefile(source, alias):
-            return
-        os.unlink(alias)
-    # A hard link gives ONNX Runtime the embedded filename without duplicating
-    # the multi-gigabyte external data file.
-    os.link(source, alias)
 
 
 def wd_tag(wd_model: InferenceSession, img: Image.Image):
@@ -399,9 +422,15 @@ async def download_model(model, client_id, node):
     url = url.replace("{HF_ENDPOINT}", hf_endpoint)
     url = f"{url}/resolve/main"
 
-    model_path = config["model_path"].get(model, "model.onnx")
+    model_path = config["model_path"].get(model, model + ".onnx")
     metadata_path = config["metadata_path"].get(model, "selected_tags.csv")
     external_data_path = config.get("external_data_path", {}).get(model, None)
+    dest_model_path = os.path.join(models_dir, model_path)
+    dest_metadata_path = os.path.join(models_dir, metadata_path)
+
+    # 优先读取 models.json 中的 remote 映射关系，缺省则取本地路径的 basename
+    remote_model_path = config.get("remote_model_path", {}).get(model, os.path.basename(model_path))
+    remote_metadata_path = config.get("remote_metadata_path", {}).get(model, os.path.basename(metadata_path))
 
     # Support HF token for gated models.
     # Priority: HF_TOKEN env var → HUGGINGFACE_TOKEN env var → huggingface_hub cache (hf auth login)
@@ -421,19 +450,38 @@ async def download_model(model, client_id, node):
             nonlocal client_id
 
         try:
-            await download_to_file(
-                f"{url}/{model_path}", os.path.join(models_dir, f"{model}.onnx"), update_callback, session=session)
-
-            # Download external data file if the model uses it (e.g. cl_tagger_v2 with model.onnx.data)
-            if external_data_path:
-                ext_data_dest = os.path.join(models_dir, f"{model}.onnx.data")
-                log(f"Downloading external data file for {model}...", "INFO", True)
+            # Only download the ONNX model file if it does not exist locally
+            if not os.path.exists(dest_model_path):
+                os.makedirs(os.path.dirname(dest_model_path), exist_ok=True)
+                log(f"Downloading model {model} to {dest_model_path}...", "INFO", True)
                 await download_to_file(
-                    f"{url}/{external_data_path}", ext_data_dest, update_callback, session=session)
+                    f"{url}/{remote_model_path}", dest_model_path, update_callback, session=session)
 
-            ext = metadata_path.split('.')[-1]
-            await download_to_file(
-                f"{url}/{metadata_path}", os.path.join(models_dir, f"{model}.{ext}"), update_callback, session=session)
+            # Only download external data file if required and missing
+            if external_data_path:
+                dest_ext_path = os.path.join(models_dir, external_data_path)
+                if not os.path.exists(dest_ext_path):
+                    os.makedirs(os.path.dirname(dest_ext_path), exist_ok=True)
+                    log(f"Downloading external data file for {model} to {dest_ext_path}...", "INFO", True)
+                    await download_to_file(
+                        f"{url}/{external_data_path}", dest_ext_path, update_callback, session=session)
+
+            # Only download the metadata file if it does not exist locally
+            if not os.path.exists(dest_metadata_path):
+                os.makedirs(os.path.dirname(dest_metadata_path), exist_ok=True)
+                log(f"Downloading metadata to {dest_metadata_path}...", "INFO", True)
+                await download_to_file(
+                    f"{url}/{remote_metadata_path}", dest_metadata_path, update_callback, session=session)
+
+            # Only download preprocess.json if required (animetimm models)
+            preprocess_path = config.get("preprocess_path", {}).get(model, None)
+            if preprocess_path:
+                dest_preprocess_path = os.path.join(models_dir, preprocess_path)
+                if not os.path.exists(dest_preprocess_path):
+                    os.makedirs(os.path.dirname(dest_preprocess_path), exist_ok=True)
+                    log(f"Downloading preprocess for {model} to {dest_preprocess_path}...", "INFO", True)
+                    await download_to_file(
+                        f"{url}/preprocess.json", dest_preprocess_path, update_callback, session=session)
 
             # Download preprocess.json for animetimm models (per-backbone normalization)
             if model.startswith("animetimm"):
@@ -462,7 +510,7 @@ class BooruTagger(io.ComfyNode):
     def define_schema(cls) -> io.Schema:
         return io.Schema(
             node_id="Booru Tagger",
-            category="image",
+            category="BooruTagger",
             inputs=[
                 io.Custom("TAGGER_MODEL").Input("tagger_model"),
                 io.Custom("TAGGER_INFO").Input("tagger_info"),
@@ -522,12 +570,10 @@ class BooruTagger(io.ComfyNode):
 class LoadBooruTaggerModel(io.ComfyNode):
     @classmethod
     def define_schema(cls) -> io.Schema:
-        extra = [name for name, _ in (os.path.splitext(
-            m) for m in get_installed_models()) if name not in known_models]
-        models = known_models + extra
+        models = known_models
         return io.Schema(
             node_id="Load Booru Tagger",
-            category="model",
+            category="BooruTagger",
             inputs=[
                 io.Combo.Input("model_name", options=models,
                                default=defaults["model"]),
@@ -544,15 +590,28 @@ class LoadBooruTaggerModel(io.ComfyNode):
 
     @classmethod
     async def execute(cls, model_name, replace_underscore, client_id=None, node=None) -> io.NodeOutput:
-        # Load model
-        if model_name.endswith(".onnx"):
-            model_name = model_name[0:-5]
-        installed = list(get_installed_models())
-        if not any(model_name + ".onnx" in s for s in installed):
+        # Get paths directly from models.json config to avoid scanning guessworks
+        rel_model_path = config["model_path"].get(model_name)
+        if not rel_model_path:
+            raise ValueError(f"Model path for {model_name} is not defined in models.json")
+        name = os.path.join(models_dir, rel_model_path)
+
+        rel_metadata_path = config["metadata_path"].get(model_name)
+        if not rel_metadata_path:
+            raise ValueError(f"Metadata path for {model_name} is not defined in models.json")
+        meta_path = os.path.join(models_dir, rel_metadata_path)
+
+        # Migrate legacy flat files to nested structure (from versions < 2.x)
+        _migrate_legacy_model(model_name, name, meta_path)
+
+        # Download if any required file is missing
+        needs_download = not os.path.exists(name) or not os.path.exists(meta_path)
+        preprocess_path = config.get("preprocess_path", {}).get(model_name)
+        if preprocess_path and not os.path.exists(os.path.join(models_dir, preprocess_path)):
+            needs_download = True
+        if needs_download:
             await download_model(model_name, client_id, node)
 
-        prepare_external_data_file(model_name)
-        name = os.path.join(models_dir, model_name + ".onnx")
         sess_options = onnxruntime.SessionOptions()
         sess_options.log_severity_level = 3  # Suppress provider init warnings
         model = InferenceSession(name, sess_options=sess_options, providers=defaults["ortProviders"])
@@ -560,26 +619,28 @@ class LoadBooruTaggerModel(io.ComfyNode):
         threshold = config["threshold"].get(model_name, defaults["threshold"])
         character_threshold = config["character_threshold"].get(model_name, defaults["character_threshold"])
 
-        csv_path = os.path.join(models_dir, model_name + ".csv")
-        json_path = os.path.join(models_dir, model_name + ".json")
-        if (model_name.startswith("wd") or model_name.startswith("pixai") or model_name.startswith("animetimm")) and os.path.exists(csv_path):
-            df = pd.read_csv(csv_path)
+        # Validate that metadata actually exists after the download step
+        if not os.path.exists(meta_path):
+            log(f"No tag data is found for {model_name} at: {meta_path}")
+            raise FileNotFoundError(f"Required tag metadata file is missing: {meta_path}")
+
+        if (model_name.startswith("wd") or model_name.startswith("pixai") or model_name.startswith("animetimm")) and meta_path.endswith(".csv"):
+            df = pd.read_csv(meta_path)
             # Remap WD rating tags from category 9 → 1 (rating)
             df.loc[df['category'] == 9, 'category'] = 1
             if replace_underscore:
                 df["name"] = df["name"].str.replace("_", " ")
             preprocess = _load_animetimm_preprocess(model_name) if model_name.startswith("animetimm") else None
             return io.NodeOutput(model, (df, model_name, preprocess), threshold, character_threshold)
-        elif model_name.startswith("camie") and os.path.exists(json_path):
+            
+        elif model_name.startswith("camie") and meta_path.endswith(".json"):
             df = pd.DataFrame()
-            with open(json_path) as f:
+            with open(meta_path, encoding="utf-8") as f:
                 js = json.load(f)
                 tag_mapping = js["dataset_info"]["tag_mapping"]
                 df["name"] = list(tag_mapping["idx_to_tag"].values())
                 df["category_name"] = list(
                     tag_mapping["tag_to_category"].values())
-                # Remap categories to convention:
-                #   0=general, 1=rating, 3=meta/year, 4=character/artist/copyright
                 _cat_map_camie = {
                     "general": 0, "rating": 1,
                     "meta": 3, "year": 3,
@@ -590,20 +651,16 @@ class LoadBooruTaggerModel(io.ComfyNode):
             if replace_underscore:
                 df["name"] = df["name"].str.replace("_", " ")
             return io.NodeOutput(model, (df, model_name), threshold, character_threshold)
-        elif model_name.startswith("cl-tagger-v1") and os.path.exists(json_path):
+            
+        elif model_name.startswith("cl-tagger-v1") and meta_path.endswith(".json"):
             df = pd.DataFrame()
-            with open(json_path, encoding="utf-8") as f:
+            with open(meta_path, encoding="utf-8") as f:
                 js = json.load(f)
 
-                # Handle both tag_mapping.json formats:
-                # Format A: dict-of-dicts {0: {"tag": "...", "category": "General"}, ...}
-                # Format B: {"idx_to_tag": {...}, "tag_to_category": {...}, "categories": [...]}
                 if "idx_to_tag" in js:
-                    # Format B (same structure as cl_tagger_v2)
                     idx_to_tag = js["idx_to_tag"]
                     tag_to_category = js["tag_to_category"]
                 else:
-                    # Format A: dict with int keys, each having "tag" and "category"
                     idx_to_tag = {}
                     tag_to_category = {}
                     for k, v in js.items():
@@ -612,9 +669,6 @@ class LoadBooruTaggerModel(io.ComfyNode):
                         idx_to_tag[str(idx)] = tag_name
                         tag_to_category[tag_name] = v["category"]
 
-                # Category mapping (see convention at top of get_tag):
-                #   rating → 1   quality → 2   meta/model → 3
-                #   character/copyright/artist → 4   general → 0
                 _cat_map_v1 = {
                     "general": 0, "rating": 1, "quality": 2,
                     "meta": 3, "model": 3,
@@ -634,17 +688,15 @@ class LoadBooruTaggerModel(io.ComfyNode):
             if replace_underscore:
                 df["name"] = df["name"].str.replace("_", " ")
             return io.NodeOutput(model, (df, model_name), threshold, character_threshold)
-        elif model_name.startswith("cl-tagger-v2") and os.path.exists(json_path):
+            
+        elif model_name.startswith("cl-tagger-v2") and meta_path.endswith(".json"):
             df = pd.DataFrame()
-            with open(json_path, encoding="utf-8") as f:
+            with open(meta_path, encoding="utf-8") as f:
                 js = json.load(f)
                 idx_to_tag = js["idx_to_tag"]
                 tag_to_category = js["tag_to_category"]
                 categories = js["categories"]
 
-                # Category mapping (see convention at top of get_tag):
-                #   rating → 1   quality → 2   meta → 3
-                #   character/copyright → 4   general → 0
                 _cat_map_v2 = {
                     "general": 0, "rating": 1, "quality": 2,
                     "meta": 3,
@@ -653,7 +705,6 @@ class LoadBooruTaggerModel(io.ComfyNode):
 
                 tag_names = []
                 tag_cats = []
-                # idx_to_tag keys are strings, iterate in sorted order for consistency
                 for idx_str in sorted(idx_to_tag.keys(), key=int):
                     tag_name = idx_to_tag[idx_str]
                     category = tag_to_category.get(tag_name, "").lower()
@@ -666,16 +717,16 @@ class LoadBooruTaggerModel(io.ComfyNode):
                 df["name"] = df["name"].str.replace("_", " ")
             return io.NodeOutput(model, (df, model_name), threshold, character_threshold)
         else:
-            log("No tag data is found.")
-            exit(1)
-
+            log("No compatible tag data parser found for this model.")
+            # Raise an exception instead of calling exit(1) to prevent ComfyUI from freezing
+            raise ValueError(f"No compatible tag data parser found for model: {model_name}")
 
 class UniqueTags(io.ComfyNode):
     @classmethod
     def define_schema(cls) -> io.Schema:
         return io.Schema(
             node_id="Unique Tags",
-            category="text",
+            category="BooruTagger",
             inputs=[
                 io.String.Input("input_tags")
             ],

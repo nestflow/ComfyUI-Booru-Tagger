@@ -7,5 +7,5 @@ async def comfy_entrypoint() -> BooruTaggerExtension:
     if init(check_imports=["onnxruntime"]):
         return BooruTaggerExtension()
     else:
-        exit(1)
+        raise ImportError("onnxruntime is required.")
 

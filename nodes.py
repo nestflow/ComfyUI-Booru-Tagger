@@ -93,6 +93,7 @@ def _migrate_legacy_model(model_name, dest_model, dest_meta):
 
         legacy_csv = os.path.join(legacy_dir, model_name + ".csv")
         legacy_json = os.path.join(legacy_dir, model_name + ".json")
+        legacy_preprocess = os.path.join(legacy_dir, model_name + ".preprocess.json")
 
         os.makedirs(os.path.dirname(dest_model), exist_ok=True)
         if not os.path.exists(dest_model):
@@ -104,6 +105,14 @@ def _migrate_legacy_model(model_name, dest_model, dest_meta):
                 if not os.path.exists(dest_meta):
                     os.rename(legacy_meta, dest_meta)
                 break
+
+        # Migrate preprocess.json if present (animetimm models)
+        preprocess_path = config.get("preprocess_path", {}).get(model_name)
+        if preprocess_path and os.path.exists(legacy_preprocess):
+            dest_preprocess = os.path.join(models_dir, preprocess_path)
+            os.makedirs(os.path.dirname(dest_preprocess), exist_ok=True)
+            if not os.path.exists(dest_preprocess):
+                os.rename(legacy_preprocess, dest_preprocess)
 
         log(f"Migrated legacy files for {model_name} from {legacy_dir} to nested layout", "INFO", True)
         return
@@ -397,8 +406,8 @@ def animetimm_tag(animetimm_model: InferenceSession, img: Image.Image, preproces
 
 
 def _load_animetimm_preprocess(model_name: str) -> dict:
-    """Load the per-model preprocess.json shipped alongside the ONNX file."""
-    path = os.path.join(models_dir, f"{model_name}.preprocess.json")
+    """Load the per-model preprocess.json from its model subdirectory."""
+    path = os.path.join(models_dir, config["preprocess_path"][model_name])
     if not os.path.exists(path):
         log(f"No preprocess.json found for {model_name}, using fallback", "WARN", True)
         return {
@@ -668,11 +677,6 @@ async def download_model(model, client_id, node):
                     log(f"Downloading preprocess for {model} to {dest_preprocess_path}...", "INFO", True)
                     await download_to_file(
                         f"{url}/preprocess.json", dest_preprocess_path, update_callback, session=session)
-
-            # Download preprocess.json for animetimm models (per-backbone normalization)
-            if model.startswith("animetimm"):
-                await download_to_file(
-                    f"{url}/preprocess.json", os.path.join(models_dir, f"{model}.preprocess.json"), update_callback, session=session)
 
         except aiohttp.ClientConnectorError as err:
             log("Unable to download model. Download files manually or try using a HF mirror/proxy website by setting the environment variable HF_ENDPOINT=https://.....", "ERROR", True)

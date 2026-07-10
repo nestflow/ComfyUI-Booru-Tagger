@@ -180,6 +180,78 @@ def camie_tag(camie_model: InferenceSession, img):
     return result
 
 
+def animetimm_tag(animetimm_model: InferenceSession, img: Image.Image, preprocess: dict):
+    """Inference for animetimm timm-based taggers (dbv4-full family).
+
+    Preprocessing pipeline matches the model's preprocess.json:
+      PadToSize → Resize → CenterCrop → Normalize
+    Mean/std and sizes are per-backbone, read from the downloaded preprocess.json.
+    """
+    # Extract pipeline params from preprocess.json (test split)
+    steps = preprocess["test"]
+    pad_step = next(s for s in steps if s["type"] == "pad_to_size")
+    resize_step = next(s for s in steps if s["type"] == "resize")
+    crop_step = next(s for s in steps if s["type"] == "center_crop")
+    norm_step = next(s for s in steps if s["type"] == "normalize")
+
+    pad_size = tuple(pad_step["size"])          # e.g. (512, 512)
+    resize_size = resize_step["size"]            # int (shorter side) or [int, int] (exact)
+    crop_size = crop_step["size"]                # [int, int]
+    mean = norm_step["mean"]
+    std = norm_step["std"]
+
+    # PadToSize: pad shorter side with white so both dims ≥ pad_size
+    img_np = np.array(img.convert("RGB"))
+    h, w = img_np.shape[:2]
+    if h < pad_size[0] or w < pad_size[1]:
+        new_h = max(h, pad_size[0])
+        new_w = max(w, pad_size[1])
+        padded = np.full((new_h, new_w, 3), 255, dtype=np.uint8)
+        off_h = (new_h - h) // 2
+        off_w = (new_w - w) // 2
+        padded[off_h:off_h+h, off_w:off_w+w] = img_np
+        img = Image.fromarray(padded)
+
+    # PadToSize → Resize → CenterCrop → Normalize  (exactly as preprocess.json)
+    transform = transforms.Compose([
+        transforms.Resize(resize_size, interpolation=transforms.InterpolationMode.BICUBIC, antialias=True),
+        transforms.CenterCrop(crop_size),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=mean, std=std)
+    ])
+
+    img_tensor = transform(img)
+    img_numpy = torch.unsqueeze(img_tensor, 0).numpy()
+
+    # Run all outputs — timm ONNX exports may have multiple heads (embedding + logits).
+    # Pick the output with the largest last dimension (the tag logits).
+    img_input = animetimm_model.get_inputs()[0]
+    output_names = [o.name for o in animetimm_model.get_outputs()]
+    outputs = animetimm_model.run(output_names, {img_input.name: img_numpy})
+    best_idx = max(range(len(outputs)), key=lambda i: outputs[i].shape[-1])
+    logits = outputs[best_idx]
+    probs = 1.0 / (1.0 + np.exp(-logits))
+    result = probs[0]
+    return result
+
+
+def _load_animetimm_preprocess(model_name: str) -> dict:
+    """Load the per-model preprocess.json shipped alongside the ONNX file."""
+    path = os.path.join(models_dir, f"{model_name}.preprocess.json")
+    if not os.path.exists(path):
+        log(f"No preprocess.json found for {model_name}, using fallback", "WARN", True)
+        return {
+            "test": [
+                {"type": "pad_to_size", "size": [512, 512]},
+                {"type": "resize", "size": [448, 448]},
+                {"type": "center_crop", "size": [448, 448]},
+                {"type": "normalize", "mean": [0.485, 0.456, 0.406], "std": [0.229, 0.224, 0.225]}
+            ]
+        }
+    with open(path) as f:
+        return json.load(f)
+
+
 def cl_tagger_v2_tag(cl_model: InferenceSession, img: Image.Image):
     img_input = cl_model.get_inputs()[0]
     (batch_size, channel, height, width) = img_input.shape
@@ -286,8 +358,15 @@ def get_tag(probs, tags_df: pd.DataFrame, threshold=0.35, character_threshold=0.
     if sort_tags:
         df = df.sort_values(by='probs', ascending=False)
 
-    general = df[(df['category'] == 0) & (df['probs'] > threshold)]['name'].to_list()
-    character = df[(df['category'] == 4) & (df['probs'] > character_threshold)]['name'].to_list()
+    # Use per-tag best_threshold when available (animetimm models), else global threshold.
+    # Per-tag thresholds act as a floor; the user's slider can raise the bar further.
+    if 'best_threshold' in df.columns:
+        best = df['best_threshold'].fillna(1.0)
+        general = df[(df['category'] == 0) & (df['probs'] >= np.maximum(best, threshold))]['name'].to_list()
+        character = df[(df['category'] == 4) & (df['probs'] >= np.maximum(best, character_threshold))]['name'].to_list()
+    else:
+        general = df[(df['category'] == 0) & (df['probs'] > threshold)]['name'].to_list()
+        character = df[(df['category'] == 4) & (df['probs'] > character_threshold)]['name'].to_list()
     rating = _pick_top_rating(df)
 
     remove = [s.strip() for s in exclude_tags.lower().split(",")] if exclude_tags else []
@@ -324,8 +403,15 @@ async def download_model(model, client_id, node):
     metadata_path = config["metadata_path"].get(model, "selected_tags.csv")
     external_data_path = config.get("external_data_path", {}).get(model, None)
 
-    # Support HF token for gated models (set HF_TOKEN environment variable)
+    # Support HF token for gated models.
+    # Priority: HF_TOKEN env var → HUGGINGFACE_TOKEN env var → huggingface_hub cache (hf auth login)
     hf_token = os.getenv("HF_TOKEN", os.getenv("HUGGINGFACE_TOKEN"))
+    if not hf_token:
+        try:
+            from huggingface_hub import get_token
+            hf_token = get_token()
+        except Exception:
+            pass
     headers = {}
     if hf_token:
         headers["Authorization"] = f"Bearer {hf_token}"
@@ -349,13 +435,18 @@ async def download_model(model, client_id, node):
             await download_to_file(
                 f"{url}/{metadata_path}", os.path.join(models_dir, f"{model}.{ext}"), update_callback, session=session)
 
+            # Download preprocess.json for animetimm models (per-backbone normalization)
+            if model.startswith("animetimm"):
+                await download_to_file(
+                    f"{url}/preprocess.json", os.path.join(models_dir, f"{model}.preprocess.json"), update_callback, session=session)
+
         except aiohttp.ClientConnectorError as err:
             log("Unable to download model. Download files manually or try using a HF mirror/proxy website by setting the environment variable HF_ENDPOINT=https://.....", "ERROR", True)
             raise
         except aiohttp.ClientError as err:
             status = getattr(err, 'status', None)
             if status == 401:
-                log(f"Authentication required for {model}. Set the HF_TOKEN environment variable with your HuggingFace token.", "ERROR", True)
+                log(f"Authentication required for {model}. Run `hf auth login` or set the HF_TOKEN environment variable with your HuggingFace token.", "ERROR", True)
             else:
                 log(f"Download failed: {err}", "ERROR", True)
             raise
@@ -408,6 +499,9 @@ class BooruTagger(io.ComfyNode):
                 probs = pixai_tag(tagger_model, img)
             elif model_name.startswith("camie-tagger-v2"):
                 probs = camie_tag(tagger_model, img)
+            elif model_name.startswith("animetimm"):
+                preprocess = _load_animetimm_preprocess(model_name)
+                probs = animetimm_tag(tagger_model, img, preprocess)
             elif model_name.startswith("cl-tagger-v1"):
                 probs = cl_tagger_v1_tag(tagger_model, img)
             elif model_name.startswith("cl-tagger-v2"):
@@ -468,13 +562,14 @@ class LoadBooruTaggerModel(io.ComfyNode):
 
         csv_path = os.path.join(models_dir, model_name + ".csv")
         json_path = os.path.join(models_dir, model_name + ".json")
-        if (model_name.startswith("wd") or model_name.startswith("pixai")) and os.path.exists(csv_path):
+        if (model_name.startswith("wd") or model_name.startswith("pixai") or model_name.startswith("animetimm")) and os.path.exists(csv_path):
             df = pd.read_csv(csv_path)
             # Remap WD rating tags from category 9 → 1 (rating)
             df.loc[df['category'] == 9, 'category'] = 1
             if replace_underscore:
                 df["name"] = df["name"].str.replace("_", " ")
-            return io.NodeOutput(model, (df, model_name), threshold, character_threshold)
+            preprocess = _load_animetimm_preprocess(model_name) if model_name.startswith("animetimm") else None
+            return io.NodeOutput(model, (df, model_name, preprocess), threshold, character_threshold)
         elif model_name.startswith("camie") and os.path.exists(json_path):
             df = pd.DataFrame()
             with open(json_path) as f:

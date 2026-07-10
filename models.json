@@ -28,7 +28,10 @@
 		"wd-v1-4-vit-tagger-v2": "{HF_ENDPOINT}/SmilingWolf/wd-v1-4-vit-tagger-v2",
 		"wd-v1-4-swinv2-tagger-v2": "{HF_ENDPOINT}/SmilingWolf/wd-v1-4-swinv2-tagger-v2",
 		"wd-v1-4-convnext-tagger": "{HF_ENDPOINT}/SmilingWolf/wd-v1-4-convnext-tagger",
-		"wd-v1-4-vit-tagger": "{HF_ENDPOINT}/SmilingWolf/wd-v1-4-vit-tagger"
+		"wd-v1-4-vit-tagger": "{HF_ENDPOINT}/SmilingWolf/wd-v1-4-vit-tagger",
+		"animetimm-swinv2_base-dbv4-full": "{HF_ENDPOINT}/animetimm/swinv2_base_window8_256.dbv4-full",
+		"animetimm-eva02_large_patch14_448-dbv4-full": "{HF_ENDPOINT}/animetimm/eva02_large_patch14_448.dbv4-full",
+		"animetimm-caformer_b36-dbv4-full": "{HF_ENDPOINT}/animetimm/caformer_b36.dbv4-full"
 	},
 	"model_path": {
 		"camie-tagger-v2": "camie-tagger-v2.onnx",
@@ -57,7 +60,10 @@
 		"cl-tagger-v1-v1_01": 0.55,
 		"cl-tagger-v1-v1_02": 0.55,
 		"cl-tagger-v2-v2_00": 0.55,
-		"cl-tagger-v2-v2_01a": 0.55
+		"cl-tagger-v2-v2_01a": 0.55,
+		"animetimm-eva02_large_patch14_448-dbv4-full": 0.0,
+		"animetimm-caformer_b36-dbv4-full": 0.0,
+		"animetimm-swinv2_base-dbv4-full": 0.0
 	},
 	"character_threshold":{
 		"pixai-tagger-v0.9": 0.85,
@@ -66,6 +72,9 @@
 		"cl-tagger-v1-v1_01": 0.6,
 		"cl-tagger-v1-v1_02": 0.6,
 		"cl-tagger-v2-v2_00": 0.55,
-		"cl-tagger-v2-v2_01a": 0.55
+		"cl-tagger-v2-v2_01a": 0.55,
+		"animetimm-eva02_large_patch14_448-dbv4-full": 0.0,
+		"animetimm-caformer_b36-dbv4-full": 0.0,
+		"animetimm-swinv2_base-dbv4-full": 0.0
 	}
 }

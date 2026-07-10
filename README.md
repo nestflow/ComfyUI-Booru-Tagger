@@ -9,6 +9,7 @@
     - [Camie Tagger v2](https://huggingface.co/Camais03/camie-tagger-v2)
     - [CL Tagger v1 (1.00 / 1.01 / 1.02)](https://huggingface.co/cella110n/cl_tagger)
     - [CL Tagger v2 (2.00 / 2.01a)](https://huggingface.co/cella110n/cl_tagger_v2)
+    - [AnimeTimm dbv4-full](https://huggingface.co/animetimm) — timm-based taggers with 12,476 tags (caformer, eva02, swinv2)
 4. **Multiple output fields** — `tags` (combined), `general_tags`, `rating`, `character_tags`
 
 A [ComfyUI](https://github.com/comfyanonymous/ComfyUI) extension allowing the interrogation of booru tags from images.
@@ -31,8 +32,11 @@ A [ComfyUI](https://github.com/comfyanonymous/ComfyUI) extension allowing the in
 | Camie Tagger v2 | 70,527 | 512² | ? | No |
 | CL Tagger v1 (1.00 / 1.01 / 1.02) | 42,163 | 448² | Apache-2.0 | No |
 | CL Tagger v2 (2.00 / 2.01a) | 106,536 / 108,036 | 384² | Custom | **Yes** |
+| AnimeTimm swinv2_base | 12,476 | 256² | GPL-3.0 | **Yes** |
+| AnimeTimm eva02_large | 12,476 | 448² | GPL-3.0 | **Yes** |
+| AnimeTimm caformer_b36 | 12,476 | 384² | GPL-3.0 | **Yes** |
 
-> **CL Tagger v2 requires a HuggingFace token.** Accept the license at [cella110n/cl_tagger_v2](https://huggingface.co/cella110n/cl_tagger_v2), then set the `HF_TOKEN` environment variable before first download.
+> **Gated models require a HuggingFace token.** Accept the license on the model page, then either run `huggingface-cli login` or set the `HF_TOKEN` environment variable before first download.
 
 Credits:
 - [pythongosssss/ComfyUI-WD14-Tagger](https://github.com/pythongosssss/ComfyUI-WD14-Tagger)
@@ -44,11 +48,12 @@ Models created by:
 - Pixai Tagger: [pixai-labs](https://huggingface.co/pixai-labs)
 - Camie Tagger: [Camais03](https://huggingface.co/Camais03)
 - CL Tagger v1 / v2: [cella110n](https://huggingface.co/cella110n)
+- AnimeTimm: [DeepGHS](https://huggingface.co/deepghs) / [narugo1992](https://huggingface.co/narugo1992)
 
 ## Installation
 1. Clone this repo into the `custom_nodes` folder.
 2. Install dependency (`onnxruntime` or `onnxruntime-gpu` for CUDA acceleration).
-3. For CL Tagger v2 (gated model): set the `HF_TOKEN` environment variable with your HuggingFace token.
+3. For gated models (CL Tagger v2, AnimeTimm): run `huggingface-cli login` once, or set the `HF_TOKEN` environment variable with your HuggingFace token.
 
 ## Configuration
 

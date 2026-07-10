@@ -134,6 +134,96 @@ def wd_tag(wd_model: InferenceSession, img: Image.Image):
     return result
 
 
+def wd_tag_batch(wd_model: InferenceSession, images: list[Image.Image]):
+    """Run WD tagger on a batch of images in a single ONNX call."""
+    img_input = wd_model.get_inputs()[0]
+    (_, height, width, channel) = img_input.shape
+
+    batch = []
+    for img in images:
+        ratio = float(height) / max(img.size)
+        new_size = tuple([int(x * ratio) for x in img.size])
+        img = img.resize(new_size, Image.Resampling.LANCZOS)
+        new_img = Image.new("RGB", (height, height), (255, 255, 255))
+        paste_x = (height - new_size[0]) // 2
+        paste_y = (height - new_size[1]) // 2
+        new_img.paste(img, (paste_x, paste_y))
+        img_np = np.array(new_img, dtype=np.float32)[:, :, ::-1]  # RGB -> BGR
+        batch.append(img_np)
+
+    batch_np = np.stack(batch, axis=0)  # [B, H, W, C]
+    label_name = wd_model.get_outputs()[0].name
+    return wd_model.run([label_name], {img_input.name: batch_np})[0]
+
+
+def pixai_tag_batch(pixai_model: InferenceSession, images: list[Image.Image]):
+    """Run Pixai tagger on a batch of images in a single ONNX call."""
+    img_input = pixai_model.get_inputs()[0]
+    (_, channel, height, width) = img_input.shape
+
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+    ])
+    batch = []
+    for img in images:
+        ratio = float(height) / max(img.size)
+        new_size = tuple([int(x * ratio) for x in img.size])
+        img = img.resize(new_size, Image.Resampling.LANCZOS)
+        new_img = Image.new("RGB", (height, height), (128, 128, 128))
+        paste_x = (height - new_size[0]) // 2
+        paste_y = (height - new_size[1]) // 2
+        new_img.paste(img, (paste_x, paste_y))
+        batch.append(transform(new_img))
+
+    batch_t = torch.stack(batch, dim=0).numpy()  # [B, C, H, W]
+    pred_name = pixai_model.get_outputs()[2].name
+    return pixai_model.run([pred_name], {img_input.name: batch_t})[0]
+
+
+def animetimm_tag_batch(animetimm_model: InferenceSession, images: list[Image.Image], preprocess: dict):
+    """Run animetimm tagger on a batch of images in a single ONNX call."""
+    steps = preprocess["test"]
+    pad_step = next(s for s in steps if s["type"] == "pad_to_size")
+    resize_step = next(s for s in steps if s["type"] == "resize")
+    crop_step = next(s for s in steps if s["type"] == "center_crop")
+    norm_step = next(s for s in steps if s["type"] == "normalize")
+
+    pad_size = tuple(pad_step["size"])
+    resize_size = resize_step["size"]
+    crop_size = crop_step["size"]
+    mean = norm_step["mean"]
+    std = norm_step["std"]
+
+    transform = transforms.Compose([
+        transforms.Resize(resize_size, interpolation=transforms.InterpolationMode.BICUBIC, antialias=True),
+        transforms.CenterCrop(crop_size),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=mean, std=std)
+    ])
+    batch = []
+    for img in images:
+        img_np = np.array(img.convert("RGB"))
+        h, w = img_np.shape[:2]
+        if h < pad_size[0] or w < pad_size[1]:
+            new_h = max(h, pad_size[0])
+            new_w = max(w, pad_size[1])
+            padded = np.full((new_h, new_w, 3), 255, dtype=np.uint8)
+            off_h = (new_h - h) // 2
+            off_w = (new_w - w) // 2
+            padded[off_h:off_h + h, off_w:off_w + w] = img_np
+            img = Image.fromarray(padded)
+        batch.append(transform(img))
+
+    batch_t = torch.stack(batch, dim=0).numpy()  # [B, C, H, W]
+    img_input = animetimm_model.get_inputs()[0]
+    output_names = [o.name for o in animetimm_model.get_outputs()]
+    outputs = animetimm_model.run(output_names, {img_input.name: batch_t})
+    best_idx = max(range(len(outputs)), key=lambda i: outputs[i].shape[-1])
+    logits = outputs[best_idx]
+    return 1.0 / (1.0 + np.exp(-logits))
+
+
 def pixai_tag(pixai_model: InferenceSession, img):
     img_input = pixai_model.get_inputs()[0]
     (batch_size, channel, height, width) = img_input.shape
@@ -201,6 +291,54 @@ def camie_tag(camie_model: InferenceSession, img):
     probs = 1.0 / (1.0 + np.exp(-ref_logits))
     result = probs[0]
     return result
+
+
+def camie_tag_batch(camie_model: InferenceSession, images: list[Image.Image]):
+    """Run Camie tagger on a batch of images in a single ONNX call."""
+    img_input = camie_model.get_inputs()[0]
+    (_, channel, height, width) = img_input.shape
+
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+    batch = []
+    for img in images:
+        ratio = float(height) / max(img.size)
+        new_size = tuple([int(x * ratio) for x in img.size])
+        img = img.resize(new_size, Image.Resampling.LANCZOS)
+        new_img = Image.new("RGB", (height, height), (124, 116, 104))
+        paste_x = (height - new_size[0]) // 2
+        paste_y = (height - new_size[1]) // 2
+        new_img.paste(img, (paste_x, paste_y))
+        batch.append(transform(new_img))
+
+    batch_t = torch.stack(batch, dim=0).numpy()  # [B, C, H, W]
+    init_pred_name = camie_model.get_outputs()[0].name
+    refine_pred_name = camie_model.get_outputs()[1].name
+    select_cand_name = camie_model.get_outputs()[2].name
+    (_, ref_logits, _) = camie_model.run(
+        [init_pred_name, refine_pred_name, select_cand_name], {img_input.name: batch_t})
+    return 1.0 / (1.0 + np.exp(-ref_logits))
+
+
+def cl_tagger_v2_tag_batch(cl_model: InferenceSession, images: list[Image.Image]):
+    """Run CL Tagger v2 on a batch of images in a single ONNX call."""
+    img_input = cl_model.get_inputs()[0]
+    (_, channel, height, width) = img_input.shape
+
+    batch = []
+    for img in images:
+        img = img.convert("RGB").resize((width, height), Image.Resampling.BICUBIC)
+        img_np = np.asarray(img, dtype=np.float32) / 255.0
+        img_np = (img_np - 0.5) / 0.5
+        img_np = img_np.transpose(2, 0, 1)  # [C, H, W]
+        batch.append(img_np)
+
+    batch_np = np.stack(batch, axis=0)  # [B, C, H, W]
+    logits_name = cl_model.get_outputs()[0].name
+    logits = cl_model.run([logits_name], {img_input.name: batch_np})[0]
+    return 1.0 / (1.0 + np.exp(-logits))
 
 
 def animetimm_tag(animetimm_model: InferenceSession, img: Image.Image, preprocess: dict):
@@ -292,6 +430,54 @@ def cl_tagger_v2_tag(cl_model: InferenceSession, img: Image.Image):
     result = probs[0]
 
     return result
+
+
+def cl_tagger_v1_tag_batch(cl_model: InferenceSession, images: list[Image.Image]):
+    """Run CL Tagger v1 on a batch of images in a single ONNX call."""
+    img_input = cl_model.get_inputs()[0]
+    input_shape = img_input.shape
+
+    # Detect layout: NCHW = [B, 3, H, W], NHWC = [B, H, W, 3]
+    is_nchw = len(input_shape) == 4 and input_shape[1] == 3
+
+    target_size = 448
+    if is_nchw:
+        for idx in (3, 2):
+            if isinstance(input_shape[idx], int):
+                target_size = input_shape[idx]
+                break
+    else:
+        for idx in (2, 1):
+            if isinstance(input_shape[idx], int):
+                target_size = input_shape[idx]
+                break
+
+    batch = []
+    for img in images:
+        w, h = img.size
+        if w != h:
+            new_s = max(w, h)
+            new_img = Image.new("RGB", (new_s, new_s), (255, 255, 255))
+            new_img.paste(img, ((new_s - w) // 2, (new_s - h) // 2))
+            img = new_img
+        img = img.resize((target_size, target_size), Image.Resampling.BICUBIC)
+        img_np = np.asarray(img, dtype=np.float32) / 255.0
+        img_np = img_np[:, :, ::-1]  # RGB -> BGR
+        batch.append(img_np)
+
+    batch_np = np.stack(batch, axis=0)  # [B, H, W, C]
+    if is_nchw:
+        batch_np = batch_np.transpose(0, 3, 1, 2)  # [B, C, H, W]
+        mean = np.array([0.5, 0.5, 0.5], dtype=np.float32).reshape(1, 3, 1, 1)
+        std = np.array([0.5, 0.5, 0.5], dtype=np.float32).reshape(1, 3, 1, 1)
+    else:
+        mean = np.array([0.5, 0.5, 0.5], dtype=np.float32)
+        std = np.array([0.5, 0.5, 0.5], dtype=np.float32)
+
+    batch_np = (batch_np - mean) / std
+    logits_name = cl_model.get_outputs()[0].name
+    logits = cl_model.run([logits_name], {img_input.name: batch_np})[0]
+    return 1.0 / (1.0 + np.exp(-logits))
 
 
 def cl_tagger_v1_tag(cl_model: InferenceSession, img: Image.Image):
@@ -535,36 +721,61 @@ class BooruTagger(io.ComfyNode):
 
     @classmethod
     def execute(cls, tagger_model, tagger_info, image, threshold, character_threshold, trailing_comma=False, sort_tags=False, exclude_tags="") -> io.NodeOutput:
-        pbar = utils.ProgressBar(image.shape[0])
-        tags, ratings, chara_tags, general_tags = [], [], [], []
-        for i in range(image.shape[0]):
-            img = Image.fromarray(np.array(image[i] * 255, dtype=np.uint8))
+        tags_df = tagger_info[0]
+        model_name = tagger_info[1]
+        batch = [Image.fromarray(np.array(image[i] * 255, dtype=np.uint8)) for i in range(image.shape[0])]
 
-            tags_df = tagger_info[0]
-            model_name = tagger_info[1]
+        # Detect if model supports dynamic batch from its input shape
+        can_batch = not isinstance(tagger_model.get_inputs()[0].shape[0], int) or tagger_model.get_inputs()[0].shape[0] != 1
 
-            if model_name.startswith("pixai-tagger"):
-                probs = pixai_tag(tagger_model, img)
-            elif model_name.startswith("camie-tagger-v2"):
-                probs = camie_tag(tagger_model, img)
-            elif model_name.startswith("animetimm"):
+        # Run inference — batched if supported, else per-image
+        if can_batch and len(batch) > 1:
+            if model_name.startswith("animetimm"):
                 preprocess = _load_animetimm_preprocess(model_name)
-                probs = animetimm_tag(tagger_model, img, preprocess)
+                probs = animetimm_tag_batch(tagger_model, batch, preprocess)
+            elif model_name.startswith("pixai-tagger"):
+                probs = pixai_tag_batch(tagger_model, batch)
+            elif model_name.startswith("camie-tagger-v2"):
+                probs = camie_tag_batch(tagger_model, batch)
             elif model_name.startswith("cl-tagger-v1"):
-                probs = cl_tagger_v1_tag(tagger_model, img)
+                probs = cl_tagger_v1_tag_batch(tagger_model, batch)
             elif model_name.startswith("cl-tagger-v2"):
-                probs = cl_tagger_v2_tag(tagger_model, img)
-            else:  # WD tagger
-                probs = wd_tag(tagger_model, img)
+                probs = cl_tagger_v2_tag_batch(tagger_model, batch)
+            else:
+                probs = wd_tag_batch(tagger_model, batch)
+        else:
+            probs = None  # per-image fallback
 
-            result = get_tag(probs, tags_df, threshold,
+        pbar = utils.ProgressBar(image.shape[0])
+        tags_list, ratings_list, chara_list, general_list = [], [], [], []
+
+        for i in range(image.shape[0]):
+            if probs is not None:
+                p = probs[i]
+            else:
+                img = batch[i]
+                if model_name.startswith("pixai-tagger"):
+                    p = pixai_tag(tagger_model, img)
+                elif model_name.startswith("camie-tagger-v2"):
+                    p = camie_tag(tagger_model, img)
+                elif model_name.startswith("animetimm"):
+                    preprocess = _load_animetimm_preprocess(model_name)
+                    p = animetimm_tag(tagger_model, img, preprocess)
+                elif model_name.startswith("cl-tagger-v1"):
+                    p = cl_tagger_v1_tag(tagger_model, img)
+                elif model_name.startswith("cl-tagger-v2"):
+                    p = cl_tagger_v2_tag(tagger_model, img)
+                else:
+                    p = wd_tag(tagger_model, img)
+
+            result = get_tag(p, tags_df, threshold,
                              character_threshold, trailing_comma, sort_tags, exclude_tags)
-            tags.append(result["combined"])
-            ratings.append(result["rating"])
-            chara_tags.append(result["character"])
-            general_tags.append(result["general"])
+            tags_list.append(result["combined"])
+            ratings_list.append(result["rating"])
+            chara_list.append(result["character"])
+            general_list.append(result["general"])
             pbar.update(1)
-        return io.NodeOutput(tags, general_tags, ratings, chara_tags)
+        return io.NodeOutput(tags_list, general_list, ratings_list, chara_list)
 
 
 class LoadBooruTaggerModel(io.ComfyNode):

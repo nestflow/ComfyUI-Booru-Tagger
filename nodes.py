@@ -571,14 +571,15 @@ def _pick_top_rating(df):
 #   4 = character (character/copyright/artist, shown in character_tags)
 
 
-def get_tag(probs, tags_df: pd.DataFrame, threshold=0.35, character_threshold=0.85, trailing_comma=False, sort_tags=False, exclude_tags=""):
+def get_tag(probs, tags_df: pd.DataFrame, threshold=0.35, character_threshold=0.85,
+            use_best_threshold=True, trailing_comma=False, sort_tags=False, exclude_tags=""):
     df = tags_df.assign(probs=probs)
     if sort_tags:
         df = df.sort_values(by='probs', ascending=False)
 
-    # Use per-tag best_threshold when available (animetimm models), else global threshold.
-    # Per-tag thresholds act as a floor; the user's slider can raise the bar further.
-    if 'best_threshold' in df.columns:
+    # Optionally use AnimeTimm's per-tag best_threshold values as a floor. The
+    # user's thresholds can always raise the bar further.
+    if use_best_threshold and 'best_threshold' in df.columns:
         best = df['best_threshold'].fillna(1.0)
         general = df[(df['category'] == 0) & (df['probs'] >= np.maximum(best, threshold))]['name'].to_list()
         character = df[(df['category'] == 4) & (df['probs'] >= np.maximum(best, character_threshold))]['name'].to_list()
@@ -709,6 +710,8 @@ class BooruTagger(io.ComfyNode):
                                step=0.05, default=defaults["threshold"]),
                 io.Float.Input("character_threshold",
                                min=0.0, max=1.0, step=0.05, default=defaults["character_threshold"]),
+                io.Boolean.Input("use_best_threshold", default=True,
+                                 tooltip="Use AnimeTimm's per-tag best_threshold values as minimum thresholds."),
                 io.Boolean.Input("trailing_comma",
                                  default=defaults["trailing_comma"]),
                 io.Boolean.Input("sort_tags", default=False),
@@ -724,9 +727,13 @@ class BooruTagger(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, tagger_model, tagger_info, image, threshold, character_threshold, trailing_comma=False, sort_tags=False, exclude_tags="") -> io.NodeOutput:
+    def execute(cls, tagger_model, tagger_info, image, threshold, character_threshold,
+                use_best_threshold=True, trailing_comma=False, sort_tags=False, exclude_tags="") -> io.NodeOutput:
         tags_df = tagger_info[0]
         model_name = tagger_info[1]
+        # AnimeTimm preprocessing is loaded alongside its model metadata. Reuse
+        # it here instead of rereading preprocess.json for every execution.
+        preprocess = tagger_info[2] if model_name.startswith("animetimm") else None
         batch = [Image.fromarray(np.array(image[i] * 255, dtype=np.uint8)) for i in range(image.shape[0])]
 
         # Detect if model supports dynamic batch from its input shape
@@ -735,7 +742,6 @@ class BooruTagger(io.ComfyNode):
         # Run inference — batched if supported, else per-image
         if can_batch and len(batch) > 1:
             if model_name.startswith("animetimm"):
-                preprocess = _load_animetimm_preprocess(model_name)
                 probs = animetimm_tag_batch(tagger_model, batch, preprocess)
             elif model_name.startswith("pixai-tagger"):
                 probs = pixai_tag_batch(tagger_model, batch)
@@ -763,7 +769,6 @@ class BooruTagger(io.ComfyNode):
                 elif model_name.startswith("camie-tagger-v2"):
                     p = camie_tag(tagger_model, img)
                 elif model_name.startswith("animetimm"):
-                    preprocess = _load_animetimm_preprocess(model_name)
                     p = animetimm_tag(tagger_model, img, preprocess)
                 elif model_name.startswith("cl-tagger-v1"):
                     p = cl_tagger_v1_tag(tagger_model, img)
@@ -773,7 +778,7 @@ class BooruTagger(io.ComfyNode):
                     p = wd_tag(tagger_model, img)
 
             result = get_tag(p, tags_df, threshold,
-                             character_threshold, trailing_comma, sort_tags, exclude_tags)
+                             character_threshold, use_best_threshold, trailing_comma, sort_tags, exclude_tags)
             tags_list.append(result["combined"])
             ratings_list.append(result["rating"])
             chara_list.append(result["character"])

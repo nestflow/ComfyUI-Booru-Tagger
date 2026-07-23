@@ -146,9 +146,9 @@
 		"cl-tagger-v1-v1_02": 0.55,
 		"cl-tagger-v2-v2_00": 0.55,
 		"cl-tagger-v2-v2_01a": 0.55,
-		"animetimm-eva02_large_patch14_448-dbv4-full": 0.0,
-		"animetimm-caformer_b36-dbv4-full": 0.0,
-		"animetimm-swinv2_base-dbv4-full": 0.0
+		"animetimm-eva02_large_patch14_448-dbv4-full": 0.39,
+		"animetimm-caformer_b36-dbv4-full": 0.39,
+		"animetimm-swinv2_base-dbv4-full": 0.41
 	},
 	"character_threshold": {
 		"pixai-tagger-v0.9": 0.85,
@@ -158,8 +158,8 @@
 		"cl-tagger-v1-v1_02": 0.6,
 		"cl-tagger-v2-v2_00": 0.55,
 		"cl-tagger-v2-v2_01a": 0.55,
-		"animetimm-eva02_large_patch14_448-dbv4-full": 0.0,
-		"animetimm-caformer_b36-dbv4-full": 0.0,
-		"animetimm-swinv2_base-dbv4-full": 0.0
+		"animetimm-eva02_large_patch14_448-dbv4-full": 0.61,
+		"animetimm-caformer_b36-dbv4-full": 0.47,
+		"animetimm-swinv2_base-dbv4-full": 0.59
 	}
 }

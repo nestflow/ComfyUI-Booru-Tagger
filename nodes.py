@@ -627,6 +627,10 @@ async def download_model(model, client_id, node):
     # 优先读取 models.json 中的 remote 映射关系，缺省则取本地路径的 basename
     remote_model_path = config.get("remote_model_path", {}).get(model, os.path.basename(model_path))
     remote_metadata_path = config.get("remote_metadata_path", {}).get(model, os.path.basename(metadata_path))
+    remote_external_data_path = config.get("remote_external_data_path", {}).get(model, external_data_path)
+    preprocess_url = config.get("preprocess_url", {}).get(model, config["model_url"][model])
+    preprocess_url = preprocess_url.replace("{HF_ENDPOINT}", hf_endpoint)
+    preprocess_url = f"{preprocess_url.rstrip('/')}/resolve/main"
 
     # Support HF token for gated models.
     # Priority: HF_TOKEN env var → HUGGINGFACE_TOKEN env var → huggingface_hub cache (hf auth login)
@@ -660,7 +664,7 @@ async def download_model(model, client_id, node):
                     os.makedirs(os.path.dirname(dest_ext_path), exist_ok=True)
                     log(f"Downloading external data file for {model} to {dest_ext_path}...", "INFO", True)
                     await download_to_file(
-                        f"{url}/{external_data_path}", dest_ext_path, update_callback, session=session)
+                        f"{url}/{remote_external_data_path}", dest_ext_path, update_callback, session=session)
 
             # Only download the metadata file if it does not exist locally
             if not os.path.exists(dest_metadata_path):
@@ -677,7 +681,7 @@ async def download_model(model, client_id, node):
                     os.makedirs(os.path.dirname(dest_preprocess_path), exist_ok=True)
                     log(f"Downloading preprocess for {model} to {dest_preprocess_path}...", "INFO", True)
                     await download_to_file(
-                        f"{url}/preprocess.json", dest_preprocess_path, update_callback, session=session)
+                        f"{preprocess_url}/preprocess.json", dest_preprocess_path, update_callback, session=session)
 
         except aiohttp.ClientConnectorError as err:
             log("Unable to download model. Download files manually or try using a HF mirror/proxy website by setting the environment variable HF_ENDPOINT=https://.....", "ERROR", True)
@@ -826,6 +830,9 @@ class LoadBooruTaggerModel(io.ComfyNode):
 
         # Download if any required file is missing
         needs_download = not os.path.exists(name) or not os.path.exists(meta_path)
+        external_data_path = config.get("external_data_path", {}).get(model_name)
+        if external_data_path and not os.path.exists(os.path.join(models_dir, external_data_path)):
+            needs_download = True
         preprocess_path = config.get("preprocess_path", {}).get(model_name)
         if preprocess_path and not os.path.exists(os.path.join(models_dir, preprocess_path)):
             needs_download = True

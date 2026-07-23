@@ -31,7 +31,8 @@
 		"wd-v1-4-vit-tagger": "{HF_ENDPOINT}/SmilingWolf/wd-v1-4-vit-tagger",
 		"animetimm-swinv2_base-dbv4-full": "{HF_ENDPOINT}/animetimm/swinv2_base_window8_256.dbv4-full",
 		"animetimm-eva02_large_patch14_448-dbv4-full": "{HF_ENDPOINT}/animetimm/eva02_large_patch14_448.dbv4-full",
-		"animetimm-caformer_b36-dbv4-full": "{HF_ENDPOINT}/animetimm/caformer_b36.dbv4-full"
+		"animetimm-caformer_b36-dbv4-full": "{HF_ENDPOINT}/animetimm/caformer_b36.dbv4-full",
+		"animetimm-convnextv2_huge-dbv4-full": "{HF_ENDPOINT}/itterative/convnextv2_huge.dbv4-full-onnx"
 	},
 	"model_path": {
 		"wd-eva02-large-tagger-v3": "wd-eva02-large-tagger-v3/model.onnx",
@@ -55,7 +56,8 @@
 		"wd-v1-4-vit-tagger": "wd-v1-4-vit-tagger/model.onnx",
 		"animetimm-swinv2_base-dbv4-full": "animetimm-swinv2_base-dbv4-full/model.onnx",
 		"animetimm-eva02_large_patch14_448-dbv4-full": "animetimm-eva02_large_patch14_448-dbv4-full/model.onnx",
-		"animetimm-caformer_b36-dbv4-full": "animetimm-caformer_b36-dbv4-full/model.onnx"
+		"animetimm-caformer_b36-dbv4-full": "animetimm-caformer_b36-dbv4-full/model.onnx",
+		"animetimm-convnextv2_huge-dbv4-full": "animetimm-convnextv2_huge-dbv4-full/model.onnx"
 	},
 	"metadata_path": {
 		"wd-eva02-large-tagger-v3": "wd-eva02-large-tagger-v3/selected_tags.csv",
@@ -79,7 +81,8 @@
 		"wd-v1-4-vit-tagger": "wd-v1-4-vit-tagger/selected_tags.csv",
 		"animetimm-swinv2_base-dbv4-full": "animetimm-swinv2_base-dbv4-full/selected_tags.csv",
 		"animetimm-eva02_large_patch14_448-dbv4-full": "animetimm-eva02_large_patch14_448-dbv4-full/selected_tags.csv",
-		"animetimm-caformer_b36-dbv4-full": "animetimm-caformer_b36-dbv4-full/selected_tags.csv"
+		"animetimm-caformer_b36-dbv4-full": "animetimm-caformer_b36-dbv4-full/selected_tags.csv",
+		"animetimm-convnextv2_huge-dbv4-full": "animetimm-convnextv2_huge-dbv4-full/selected_tags.csv"
 	},
 	"remote_model_path": {
 		"wd-eva02-large-tagger-v3": "model.onnx",
@@ -103,7 +106,8 @@
 		"wd-v1-4-vit-tagger": "model.onnx",
 		"animetimm-swinv2_base-dbv4-full": "model.onnx",
 		"animetimm-eva02_large_patch14_448-dbv4-full": "model.onnx",
-		"animetimm-caformer_b36-dbv4-full": "model.onnx"
+		"animetimm-caformer_b36-dbv4-full": "model.onnx",
+		"animetimm-convnextv2_huge-dbv4-full": "model.onnx"
 	},
 	"remote_metadata_path": {
 		"wd-eva02-large-tagger-v3": "selected_tags.csv",
@@ -127,16 +131,25 @@
 		"wd-v1-4-vit-tagger": "selected_tags.csv",
 		"animetimm-swinv2_base-dbv4-full": "selected_tags.csv",
 		"animetimm-eva02_large_patch14_448-dbv4-full": "selected_tags.csv",
-		"animetimm-caformer_b36-dbv4-full": "selected_tags.csv"
+		"animetimm-caformer_b36-dbv4-full": "selected_tags.csv",
+		"animetimm-convnextv2_huge-dbv4-full": "selected_tags.csv"
 	},
 	"preprocess_path": {
 		"animetimm-swinv2_base-dbv4-full": "animetimm-swinv2_base-dbv4-full/preprocess.json",
 		"animetimm-eva02_large_patch14_448-dbv4-full": "animetimm-eva02_large_patch14_448-dbv4-full/preprocess.json",
-		"animetimm-caformer_b36-dbv4-full": "animetimm-caformer_b36-dbv4-full/preprocess.json"
+		"animetimm-caformer_b36-dbv4-full": "animetimm-caformer_b36-dbv4-full/preprocess.json",
+		"animetimm-convnextv2_huge-dbv4-full": "animetimm-convnextv2_huge-dbv4-full/preprocess.json"
+	},
+	"preprocess_url": {
+		"animetimm-convnextv2_huge-dbv4-full": "{HF_ENDPOINT}/animetimm/convnextv2_huge.dbv4-full"
 	},
 	"external_data_path": {
 		"cl-tagger-v2-v2_00": "v2_00/model.onnx.data",
-		"cl-tagger-v2-v2_01a": "v2_01a/model.onnx.data"
+		"cl-tagger-v2-v2_01a": "v2_01a/model.onnx.data",
+		"animetimm-convnextv2_huge-dbv4-full": "animetimm-convnextv2_huge-dbv4-full/model.onnx_data"
+	},
+	"remote_external_data_path": {
+		"animetimm-convnextv2_huge-dbv4-full": "model.onnx_data"
 	},
 	"threshold": {
 		"pixai-tagger-v0.9": 0.3,
@@ -148,7 +161,8 @@
 		"cl-tagger-v2-v2_01a": 0.55,
 		"animetimm-eva02_large_patch14_448-dbv4-full": 0.39,
 		"animetimm-caformer_b36-dbv4-full": 0.39,
-		"animetimm-swinv2_base-dbv4-full": 0.41
+		"animetimm-swinv2_base-dbv4-full": 0.41,
+		"animetimm-convnextv2_huge-dbv4-full": 0.38
 	},
 	"character_threshold": {
 		"pixai-tagger-v0.9": 0.85,
@@ -160,6 +174,7 @@
 		"cl-tagger-v2-v2_01a": 0.55,
 		"animetimm-eva02_large_patch14_448-dbv4-full": 0.61,
 		"animetimm-caformer_b36-dbv4-full": 0.47,
-		"animetimm-swinv2_base-dbv4-full": 0.59
+		"animetimm-swinv2_base-dbv4-full": 0.59,
+		"animetimm-convnextv2_huge-dbv4-full": 0.51
 	}
 }

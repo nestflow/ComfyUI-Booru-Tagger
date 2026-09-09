@@ -1,13 +1,9 @@
 from comfy_api.latest import ComfyExtension, io
 import numpy as np
-import asyncio
 import os
 import aiohttp
 import folder_paths
-import sys
 import onnxruntime
-# from server import PromptServer
-from aiohttp import web
 from PIL import Image
 from .utils import get_ext_dir, download_to_file, get_extension_config, log
 from onnxruntime import InferenceSession
@@ -17,9 +13,6 @@ import pandas as pd
 import json
 import torchvision.transforms as transforms
 import torch
-
-sys.path.insert(0, os.path.join(
-    os.path.dirname(os.path.realpath(__file__)), "comfy"))
 
 config = get_extension_config()
 
@@ -607,30 +600,50 @@ def get_tag(probs, tags_df: pd.DataFrame, threshold=0.35, character_threshold=0.
     }
 
 
-async def download_model(model, client_id, node):
+class _DownloadProgress:
+    """Aggregate download progress of all model files onto one node progress bar."""
+
+    def __init__(self):
+        self._bar = None      # comfy.utils.ProgressBar
+        self._completed = 0   # bytes fully downloaded from previous files
+
+    def __call__(self, total, downloaded):
+        # Invoked after headers (downloaded == 0) and then for every chunk.
+        if total <= 0:
+            return  # Server sent no Content-Length; the console tqdm still reports progress.
+        if self._bar is None:
+            self._bar = utils.ProgressBar(self._completed + total)
+            self._bar.update_absolute(0)  # Make the bar appear immediately.
+            return
+        self._bar.update_absolute(
+            min(self._completed + downloaded, self._completed + total),
+            total=self._completed + total)
+        if downloaded >= total:
+            self._completed += total
+
+
+async def download_model(model: str) -> None:
     hf_endpoint = os.getenv("HF_ENDPOINT", defaults["HF_ENDPOINT"])
     if not hf_endpoint.startswith("https://"):
         hf_endpoint = f"https://{hf_endpoint}"
-    if hf_endpoint.endswith("/"):
-        hf_endpoint = hf_endpoint.rstrip("/")
+    hf_endpoint = hf_endpoint.rstrip("/")
 
-    url = config["model_url"][model]
-    url = url.replace("{HF_ENDPOINT}", hf_endpoint)
+    url = config["model_url"][model].replace("{HF_ENDPOINT}", hf_endpoint)
     url = f"{url}/resolve/main"
 
     model_path = config["model_path"].get(model, model + ".onnx")
     metadata_path = config["metadata_path"].get(model, "selected_tags.csv")
-    external_data_path = config.get("external_data_path", {}).get(model, None)
+    external_data_path = config.get("external_data_path", {}).get(model)
     dest_model_path = os.path.join(models_dir, model_path)
     dest_metadata_path = os.path.join(models_dir, metadata_path)
 
-    # 优先读取 models.json 中的 remote 映射关系，缺省则取本地路径的 basename
+    # Remote paths default to the basename of the local ones; they only need to be
+    # listed in models.json when the remote layout differs from the local one.
     remote_model_path = config.get("remote_model_path", {}).get(model, os.path.basename(model_path))
     remote_metadata_path = config.get("remote_metadata_path", {}).get(model, os.path.basename(metadata_path))
     remote_external_data_path = config.get("remote_external_data_path", {}).get(model, external_data_path)
     preprocess_url = config.get("preprocess_url", {}).get(model, config["model_url"][model])
-    preprocess_url = preprocess_url.replace("{HF_ENDPOINT}", hf_endpoint)
-    preprocess_url = f"{preprocess_url.rstrip('/')}/resolve/main"
+    preprocess_url = f"{preprocess_url.replace('{HF_ENDPOINT}', hf_endpoint).rstrip('/')}/resolve/main"
 
     # Support HF token for gated models.
     # Priority: HF_TOKEN env var → HUGGINGFACE_TOKEN env var → huggingface_hub cache (hf auth login)
@@ -645,17 +658,15 @@ async def download_model(model, client_id, node):
     if hf_token:
         headers["Authorization"] = f"Bearer {hf_token}"
 
-    async with aiohttp.ClientSession(loop=asyncio.get_event_loop(), headers=headers) as session:
-        async def update_callback(perc):
-            nonlocal client_id
-
+    progress = _DownloadProgress()
+    async with aiohttp.ClientSession(headers=headers) as session:
         try:
             # Only download the ONNX model file if it does not exist locally
             if not os.path.exists(dest_model_path):
                 os.makedirs(os.path.dirname(dest_model_path), exist_ok=True)
                 log(f"Downloading model {model} to {dest_model_path}...", "INFO", True)
-                await download_to_file(
-                    f"{url}/{remote_model_path}", dest_model_path, update_callback, session=session)
+                await download_to_file(f"{url}/{remote_model_path}", dest_model_path,
+                                       session=session, progress_cb=progress)
 
             # Only download external data file if required and missing
             if external_data_path:
@@ -663,25 +674,25 @@ async def download_model(model, client_id, node):
                 if not os.path.exists(dest_ext_path):
                     os.makedirs(os.path.dirname(dest_ext_path), exist_ok=True)
                     log(f"Downloading external data file for {model} to {dest_ext_path}...", "INFO", True)
-                    await download_to_file(
-                        f"{url}/{remote_external_data_path}", dest_ext_path, update_callback, session=session)
+                    await download_to_file(f"{url}/{remote_external_data_path}", dest_ext_path,
+                                           session=session, progress_cb=progress)
 
             # Only download the metadata file if it does not exist locally
             if not os.path.exists(dest_metadata_path):
                 os.makedirs(os.path.dirname(dest_metadata_path), exist_ok=True)
                 log(f"Downloading metadata to {dest_metadata_path}...", "INFO", True)
-                await download_to_file(
-                    f"{url}/{remote_metadata_path}", dest_metadata_path, update_callback, session=session)
+                await download_to_file(f"{url}/{remote_metadata_path}", dest_metadata_path,
+                                       session=session, progress_cb=progress)
 
             # Only download preprocess.json if required (animetimm models)
-            preprocess_path = config.get("preprocess_path", {}).get(model, None)
+            preprocess_path = config.get("preprocess_path", {}).get(model)
             if preprocess_path:
                 dest_preprocess_path = os.path.join(models_dir, preprocess_path)
                 if not os.path.exists(dest_preprocess_path):
                     os.makedirs(os.path.dirname(dest_preprocess_path), exist_ok=True)
                     log(f"Downloading preprocess for {model} to {dest_preprocess_path}...", "INFO", True)
-                    await download_to_file(
-                        f"{preprocess_url}/preprocess.json", dest_preprocess_path, update_callback, session=session)
+                    await download_to_file(f"{preprocess_url}/preprocess.json", dest_preprocess_path,
+                                           session=session, progress_cb=progress)
 
         except aiohttp.ClientConnectorError as err:
             log("Unable to download model. Download files manually or try using a HF mirror/proxy website by setting the environment variable HF_ENDPOINT=https://.....", "ERROR", True)
@@ -696,8 +707,6 @@ async def download_model(model, client_id, node):
         except Exception as err:
             log(f"Download failed: {err}", "ERROR", True)
             raise
-
-    return web.Response(status=200)
 
 
 class BooruTagger(io.ComfyNode):
@@ -813,7 +822,7 @@ class LoadBooruTaggerModel(io.ComfyNode):
         )
 
     @classmethod
-    async def execute(cls, model_name, replace_underscore, client_id=None, node=None) -> io.NodeOutput:
+    async def execute(cls, model_name, replace_underscore) -> io.NodeOutput:
         # Get paths directly from models.json config to avoid scanning guessworks
         rel_model_path = config["model_path"].get(model_name)
         if not rel_model_path:
@@ -837,7 +846,7 @@ class LoadBooruTaggerModel(io.ComfyNode):
         if preprocess_path and not os.path.exists(os.path.join(models_dir, preprocess_path)):
             needs_download = True
         if needs_download:
-            await download_model(model_name, client_id, node)
+            await download_model(model_name)
 
         sess_options = onnxruntime.SessionOptions()
         sess_options.log_severity_level = 3  # Suppress provider init warnings

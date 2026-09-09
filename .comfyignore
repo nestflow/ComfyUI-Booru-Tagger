@@ -1,0 +1,8 @@
+# Files excluded from the package published to the Comfy registry.
+# Everything else tracked in git is included.
+.git/
+.github/
+.gitignore
+__pycache__/
+*.py[cod]
+models/

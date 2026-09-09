@@ -1,2 +1,5 @@
-onnxruntime-gpu
+# Mirrors the [project].dependencies in pyproject.toml (the source of truth
+# used by the Comfy registry). Keep the two in sync.
 pandas
+onnxruntime-gpu; sys_platform != 'darwin'
+onnxruntime; sys_platform == 'darwin'

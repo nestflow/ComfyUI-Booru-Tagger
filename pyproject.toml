@@ -4,7 +4,14 @@ description = "A ComfyUI extension allowing the interrogation of booru tags from
 version = "1.0.0"
 requires-python = ">=3.10"
 license = { file = "LICENSE" }
-dependencies = ["onnxruntime-gpu", "pandas"]
+dependencies = [
+    "pandas",
+    # One automatic choice per platform, no user decision needed:
+    #   - Windows/Linux: CUDA-capable build (falls back to CPU at runtime)
+    #   - macOS: CPU build (onnxruntime-gpu ships no macOS wheels)
+    "onnxruntime-gpu; sys_platform != 'darwin'",
+    "onnxruntime; sys_platform == 'darwin'",
+]
 
 [project.urls]
 Repository = "https://github.com/nestflow/ComfyUI-Booru-Tagger"

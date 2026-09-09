@@ -15,18 +15,32 @@ import torchvision.transforms as transforms
 import torch
 
 config = get_extension_config()
+known_models = list(config.get("model_url", {}).keys())
 
+# models.json is the single source of truth for defaults (see its "settings"
+# section). The values below are only fallbacks for keys a config file does not
+# provide; the default model is derived from model_url so the two can never
+# drift apart again.
 defaults = {
-    "model": "wd-eva02-large-tagger-v3",
+    "model": known_models[0] if known_models else "wd-eva02-large-tagger-v3",
     "threshold": 0.35,
     "character_threshold": 0.85,
     "replace_underscore": True,
     "trailing_comma": False,
     "exclude_tags": "",
-    "ortProviders": ["CUDAExecutionProvider", "CPUExecutionProvider"],
-    "HF_ENDPOINT": "https://huggingface.co"
+    "HF_ENDPOINT": "https://huggingface.co",
 }
 defaults.update(config.get("settings", {}))
+
+# Guard against a stale default model (e.g. settings.model was removed from
+# model_url during a config edit): fall back to the first configured model.
+if defaults["model"] not in known_models:
+    if known_models:
+        log(f"Default model {defaults['model']!r} is not listed in models.json model_url, "
+            f"using {known_models[0]!r} instead", "WARN", True)
+        defaults["model"] = known_models[0]
+    else:
+        raise ValueError('models.json defines no models under "model_url".')
 
 # Filter ORT providers: try GPU first, fall back to CPU. Excludes AzureExecutionProvider (deprecated shim)
 # and TensorrtExecutionProvider (crashes without full NVIDIA TensorRT SDK installed).
@@ -56,7 +70,6 @@ _LEGACY_MODEL_DIRS = [
     os.path.join(folder_paths.models_dir, "wd14_tagger"),
     get_ext_dir("models"),
 ]
-known_models = list(config["model_url"].keys())
 
 log("Available ORT providers: " +
     ", ".join(onnxruntime.get_available_providers()), "DEBUG", True)
@@ -64,7 +77,7 @@ log("Using ORT providers: " +
     ", ".join(defaults["ortProviders"]), "DEBUG", True)
 
 def _migrate_legacy_model(model_name, dest_model, dest_meta):
-    """Move legacy flat files into the nested directory structure (v1.x → v2.x).
+    """Move legacy flat files into the nested directory structure (v1.x -> v2.x).
 
     Before v2.x, files were stored flat in one of:
       - ComfyUI/models/wd14_tagger/<model>.onnx
@@ -421,7 +434,7 @@ async def download_model(model: str) -> None:
     preprocess_url = f"{preprocess_url.replace('{HF_ENDPOINT}', hf_endpoint).rstrip('/')}/resolve/main"
 
     # Support HF token for gated models.
-    # Priority: HF_TOKEN env var → HUGGINGFACE_TOKEN env var → huggingface_hub cache (hf auth login)
+    # Priority: HF_TOKEN env var -> HUGGINGFACE_TOKEN env var -> huggingface_hub cache (hf auth login)
     hf_token = os.getenv("HF_TOKEN", os.getenv("HUGGINGFACE_TOKEN"))
     if not hf_token:
         try:
@@ -625,7 +638,7 @@ class LoadBooruTaggerModel(io.ComfyNode):
 
         if (model_name.startswith("wd") or model_name.startswith("pixai") or model_name.startswith("animetimm")) and meta_path.endswith(".csv"):
             df = pd.read_csv(meta_path)
-            # Remap WD rating tags from category 9 → 1 (rating)
+            # Remap WD rating tags from category 9 -> 1 (rating)
             df.loc[df['category'] == 9, 'category'] = 1
             if replace_underscore:
                 df["name"] = df["name"].str.replace("_", " ")

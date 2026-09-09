@@ -1,18 +1,14 @@
 # ComfyUI Booru Tagger
 
-## Modification from [pythongosssss](https://github.com/pythongosssss/ComfyUI-WD14-Tagger)
+A [ComfyUI](https://github.com/comfyanonymous/ComfyUI) extension that tags images with booru tags for use in prompts. It bundles the commonly used open tagger models — [WD](https://huggingface.co/SmilingWolf), [Pixai](https://huggingface.co/deepghs/pixai-tagger-v0.9-onnx), [Camie](https://huggingface.co/Camais03/camie-tagger-v2), [CL Tagger](https://huggingface.co/cella110n) and [AnimeTimm](https://huggingface.co/animetimm) — 23 taggers in total.
 
-1. Migrate to ComfyUI Node v3.
-2. Separate model loading and inference, much faster running! (No longer need to load models for each image input).
-3. **New model support**
-    - [Pixai Tagger v0.9 (onnx model)](https://huggingface.co/deepghs/pixai-tagger-v0.9-onnx)
-    - [Camie Tagger v2](https://huggingface.co/Camais03/camie-tagger-v2)
-    - [CL Tagger v1 (1.00 / 1.01 / 1.02)](https://huggingface.co/cella110n/cl_tagger)
-    - [CL Tagger v2 (2.00 / 2.01a)](https://huggingface.co/cella110n/cl_tagger_v2)
-    - [AnimeTimm dbv4-full](https://huggingface.co/animetimm) — timm-based taggers with 12,476 tags (caformer, eva02, swinv2, and ConvNeXtV2 Huge)
-4. **Multiple output fields** — `tags` (combined), `general_tags`, `rating`, `character_tags`
+## Features
 
-A [ComfyUI](https://github.com/comfyanonymous/ComfyUI) extension allowing the interrogation of booru tags from images.
+- **Model choice** — 23 taggers across WD, Pixai, Camie, CL Tagger and AnimeTimm; AnimeTimm models use 12,476-tag vocabularies. Use the one you prefer.
+- **Loads once** — a model is loaded the first time it is used and kept in memory, so later images do not wait for another load.
+- **Multiple images per run** — the node accepts a batch of images and returns tags for all of them.
+- **Tag groups** — results are split into general, rating and character (character/copyright/artist) tags, with options for underscores, sorting, tag exclusions and per-model thresholds.
+- **Automatic downloads** — missing model files are downloaded on first use; gated models require a HuggingFace token (accepted once on the model page).
 
 For AnimeTimm models, **use_best_threshold** defaults to enabled and applies each tag's model-provided `best_threshold` as a minimum. Disable it to use only the node's `threshold` and `character_threshold` inputs, which is useful when you prefer higher recall. The defaults are the model author's category-level recommendations: eva02 (`0.39` / `0.61`), caformer (`0.39` / `0.47`), swinv2 (`0.41` / `0.59`), and ConvNeXtV2 Huge (`0.38` / `0.51`) for general / character tags.
 
@@ -56,8 +52,9 @@ Models created by:
 - AnimeTimm: [DeepGHS](https://huggingface.co/deepghs) / [narugo1992](https://huggingface.co/narugo1992)
 
 ## Installation
-1. Clone this repo into the `custom_nodes` folder.
-2. Install dependency (`onnxruntime` or `onnxruntime-gpu` for CUDA acceleration).
+
+1. Install from the [Comfy Registry](https://registry.comfy.org/nodes/booru-tagger) (ComfyUI-Manager or `comfy node install booru-tagger`), or clone this repo into the `custom_nodes` folder.
+2. Install dependency (`onnxruntime` or `onnxruntime-gpu` for CUDA acceleration). When installing via the registry this is handled automatically.
 3. For gated models (CL Tagger v2, AnimeTimm): run `huggingface-cli login` once, or set the `HF_TOKEN` environment variable with your HuggingFace token.
 
 ## Configuration

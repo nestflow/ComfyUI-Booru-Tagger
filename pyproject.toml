@@ -1,7 +1,7 @@
 [project]
 name = "booru-tagger"
-description = "A ComfyUI extension allowing the interrogation of booru tags from images."
-version = "1.0.1"
+description = "ComfyUI nodes that tag images with booru tags for use in prompts. Bundles the commonly used tagger models — WD, Pixai, Camie, CL Tagger and AnimeTimm — keeps a model loaded for reuse across images, and outputs general, rating and character tag groups."
+version = "1.0.2"
 requires-python = ">=3.10"
 license = { file = "LICENSE" }
 dependencies = [

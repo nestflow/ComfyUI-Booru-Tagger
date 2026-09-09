@@ -111,31 +111,6 @@ def _migrate_legacy_model(model_name, dest_model, dest_meta):
         return
 
 
-def wd_tag(wd_model: InferenceSession, img: Image.Image):
-    img_input = wd_model.get_inputs()[0]
-    (batch_size, height, width, channel) = img_input.shape
-
-    # Reduce to max size and pad with white
-    ratio = float(height)/max(img.size)
-    new_size = tuple([int(x*ratio) for x in img.size])
-    img = img.resize(new_size, Image.Resampling.LANCZOS)
-    pad_color = (255, 255, 255)
-    new_img = Image.new("RGB", (height, height), pad_color)
-    paste_x = (height-new_size[0]) // 2
-    paste_y = (height-new_size[1]) // 2
-    new_img.paste(img, (paste_x, paste_y))
-
-    img_numpy = np.array(new_img, dtype=np.float32)
-    img_numpy = img_numpy[:, :, ::-1]  # RGB -> BGR
-    img_numpy = np.expand_dims(img_numpy, 0)  # Batch dim
-
-    label_name = wd_model.get_outputs()[0].name
-    probs = wd_model.run([label_name], {img_input.name: img_numpy})[0]
-    result = probs[0]
-
-    return result
-
-
 def wd_tag_batch(wd_model: InferenceSession, images: list[Image.Image]):
     """Run WD tagger on a batch of images in a single ONNX call."""
     img_input = wd_model.get_inputs()[0]
@@ -226,75 +201,6 @@ def animetimm_tag_batch(animetimm_model: InferenceSession, images: list[Image.Im
     return 1.0 / (1.0 + np.exp(-logits))
 
 
-def pixai_tag(pixai_model: InferenceSession, img):
-    img_input = pixai_model.get_inputs()[0]
-    (batch_size, channel, height, width) = img_input.shape
-
-    # Reduce to max size and pad with white
-    ratio = float(height)/max(img.size)
-    new_size = tuple([int(x*ratio) for x in img.size])
-    img = img.resize(new_size, Image.Resampling.LANCZOS)
-
-    pad_color = (128, 128, 128)
-    new_img = Image.new("RGB", (height, height), pad_color)
-    paste_x = (height-new_size[0]) // 2
-    paste_y = (height-new_size[1]) // 2
-    new_img.paste(img, (paste_x, paste_y))
-
-    transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize(
-            mean=[0.5, 0.5, 0.5],
-            std=[0.5, 0.5, 0.5]
-        )
-    ])
-
-    img_tensor = transform(new_img)
-    img_numpy = torch.unsqueeze(img_tensor, 0).numpy()
-
-    pred_name = pixai_model.get_outputs()[2].name
-    prediction = pixai_model.run([pred_name], {img_input.name: img_numpy})[0]
-    result = prediction[0]
-    return result
-
-
-def camie_tag(camie_model: InferenceSession, img):
-    img_input = camie_model.get_inputs()[0]
-    (batch_size, channel, height, width) = img_input.shape
-
-    # Reduce to max size and pad with white
-    ratio = float(height)/max(img.size)
-    new_size = tuple([int(x*ratio) for x in img.size])
-    img = img.resize(new_size, Image.Resampling.LANCZOS)
-
-    pad_color = (124, 116, 104)
-    new_img = Image.new("RGB", (height, height), pad_color)
-    paste_x = (height-new_size[0]) // 2
-    paste_y = (height-new_size[1]) // 2
-    new_img.paste(img, (paste_x, paste_y))
-
-    transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize(
-            mean=[0.485, 0.456, 0.406],
-            std=[0.229, 0.224, 0.225]
-        )
-    ])
-
-    img_tensor = transform(new_img)
-    img_numpy = torch.unsqueeze(img_tensor, 0).numpy()
-
-    init_pred_name = camie_model.get_outputs()[0].name
-    refine_pred_name = camie_model.get_outputs()[1].name
-    select_cand_name = camie_model.get_outputs()[2].name
-    (init_logits, ref_logits, select_cands) = camie_model.run(
-        [init_pred_name, refine_pred_name, select_cand_name], {img_input.name: img_numpy})
-
-    probs = 1.0 / (1.0 + np.exp(-ref_logits))
-    result = probs[0]
-    return result
-
-
 def camie_tag_batch(camie_model: InferenceSession, images: list[Image.Image]):
     """Run Camie tagger on a batch of images in a single ONNX call."""
     img_input = camie_model.get_inputs()[0]
@@ -343,61 +249,6 @@ def cl_tagger_v2_tag_batch(cl_model: InferenceSession, images: list[Image.Image]
     return 1.0 / (1.0 + np.exp(-logits))
 
 
-def animetimm_tag(animetimm_model: InferenceSession, img: Image.Image, preprocess: dict):
-    """Inference for animetimm timm-based taggers (dbv4-full family).
-
-    Preprocessing pipeline matches the model's preprocess.json:
-      PadToSize → Resize → CenterCrop → Normalize
-    Mean/std and sizes are per-backbone, read from the downloaded preprocess.json.
-    """
-    # Extract pipeline params from preprocess.json (test split)
-    steps = preprocess["test"]
-    pad_step = next(s for s in steps if s["type"] == "pad_to_size")
-    resize_step = next(s for s in steps if s["type"] == "resize")
-    crop_step = next(s for s in steps if s["type"] == "center_crop")
-    norm_step = next(s for s in steps if s["type"] == "normalize")
-
-    pad_size = tuple(pad_step["size"])          # e.g. (512, 512)
-    resize_size = resize_step["size"]            # int (shorter side) or [int, int] (exact)
-    crop_size = crop_step["size"]                # [int, int]
-    mean = norm_step["mean"]
-    std = norm_step["std"]
-
-    # PadToSize: pad shorter side with white so both dims ≥ pad_size
-    img_np = np.array(img.convert("RGB"))
-    h, w = img_np.shape[:2]
-    if h < pad_size[0] or w < pad_size[1]:
-        new_h = max(h, pad_size[0])
-        new_w = max(w, pad_size[1])
-        padded = np.full((new_h, new_w, 3), 255, dtype=np.uint8)
-        off_h = (new_h - h) // 2
-        off_w = (new_w - w) // 2
-        padded[off_h:off_h+h, off_w:off_w+w] = img_np
-        img = Image.fromarray(padded)
-
-    # PadToSize → Resize → CenterCrop → Normalize  (exactly as preprocess.json)
-    transform = transforms.Compose([
-        transforms.Resize(resize_size, interpolation=transforms.InterpolationMode.BICUBIC, antialias=True),
-        transforms.CenterCrop(crop_size),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=mean, std=std)
-    ])
-
-    img_tensor = transform(img)
-    img_numpy = torch.unsqueeze(img_tensor, 0).numpy()
-
-    # Run all outputs — timm ONNX exports may have multiple heads (embedding + logits).
-    # Pick the output with the largest last dimension (the tag logits).
-    img_input = animetimm_model.get_inputs()[0]
-    output_names = [o.name for o in animetimm_model.get_outputs()]
-    outputs = animetimm_model.run(output_names, {img_input.name: img_numpy})
-    best_idx = max(range(len(outputs)), key=lambda i: outputs[i].shape[-1])
-    logits = outputs[best_idx]
-    probs = 1.0 / (1.0 + np.exp(-logits))
-    result = probs[0]
-    return result
-
-
 def _load_animetimm_preprocess(model_name: str) -> dict:
     """Load the per-model preprocess.json from its model subdirectory."""
     path = os.path.join(models_dir, config["preprocess_path"][model_name])
@@ -413,25 +264,6 @@ def _load_animetimm_preprocess(model_name: str) -> dict:
         }
     with open(path) as f:
         return json.load(f)
-
-
-def cl_tagger_v2_tag(cl_model: InferenceSession, img: Image.Image):
-    img_input = cl_model.get_inputs()[0]
-    (batch_size, channel, height, width) = img_input.shape
-
-    # SigLIP2 preprocessing: direct resize to 384x384, normalize mean=std=0.5
-    img = img.convert("RGB").resize((width, height), Image.Resampling.BICUBIC)
-
-    img_numpy = np.asarray(img, dtype=np.float32) / 255.0
-    img_numpy = (img_numpy - 0.5) / 0.5
-    img_numpy = img_numpy.transpose(2, 0, 1)[None]  # [1, 3, H, W]
-
-    logits_name = cl_model.get_outputs()[0].name
-    logits = cl_model.run([logits_name], {img_input.name: img_numpy})[0]
-    probs = 1.0 / (1.0 + np.exp(-logits))
-    result = probs[0]
-
-    return result
 
 
 def cl_tagger_v1_tag_batch(cl_model: InferenceSession, images: list[Image.Image]):
@@ -480,63 +312,6 @@ def cl_tagger_v1_tag_batch(cl_model: InferenceSession, images: list[Image.Image]
     logits_name = cl_model.get_outputs()[0].name
     logits = cl_model.run([logits_name], {img_input.name: batch_np})[0]
     return 1.0 / (1.0 + np.exp(-logits))
-
-
-def cl_tagger_v1_tag(cl_model: InferenceSession, img: Image.Image):
-    img_input = cl_model.get_inputs()[0]
-    input_shape = img_input.shape
-
-    # Detect layout from raw shape (may contain strings for dynamic dims)
-    # NCHW: [batch, 3, H, W]   NHWC: [batch, H, W, 3]
-    is_nchw = len(input_shape) == 4 and input_shape[1] == 3
-    is_nhwc = len(input_shape) == 4 and input_shape[3] == 3
-
-    # Determine target size, fall back to 448
-    target_size = 448
-    if is_nchw:
-        for idx in (3, 2):  # prefer W, then H
-            if isinstance(input_shape[idx], int):
-                target_size = input_shape[idx]
-                break
-    elif is_nhwc:
-        for idx in (2, 1):  # prefer W, then H
-            if isinstance(input_shape[idx], int):
-                target_size = input_shape[idx]
-                break
-
-    # Pad to square with white (same as wd-eva02-large-tagger-v3 preprocessing)
-    width, height = img.size
-    if width != height:
-        new_size = max(width, height)
-        new_img = Image.new("RGB", (new_size, new_size), (255, 255, 255))
-        paste_x = (new_size - width) // 2
-        paste_y = (new_size - height) // 2
-        new_img.paste(img, (paste_x, paste_y))
-        img = new_img
-
-    # Resize to target size
-    img = img.resize((target_size, target_size), Image.Resampling.BICUBIC)
-
-    img_numpy = np.asarray(img, dtype=np.float32) / 255.0
-    img_numpy = img_numpy[:, :, ::-1]  # RGB -> BGR
-
-    if is_nchw:
-        img_numpy = img_numpy.transpose(2, 0, 1)  # HWC -> CHW
-        mean = np.array([0.5, 0.5, 0.5], dtype=np.float32).reshape(3, 1, 1)
-        std = np.array([0.5, 0.5, 0.5], dtype=np.float32).reshape(3, 1, 1)
-    else:
-        mean = np.array([0.5, 0.5, 0.5], dtype=np.float32)
-        std = np.array([0.5, 0.5, 0.5], dtype=np.float32)
-
-    img_numpy = (img_numpy - mean) / std
-    img_numpy = np.expand_dims(img_numpy, 0)  # [1, C, H, W] or [1, H, W, C]
-
-    logits_name = cl_model.get_outputs()[0].name
-    logits = cl_model.run([logits_name], {img_input.name: img_numpy})[0]
-    probs = 1.0 / (1.0 + np.exp(-logits))
-    result = probs[0]
-
-    return result
 
 
 def _format_tags(tag_list, trailing_comma=False):
@@ -747,50 +522,38 @@ class BooruTagger(io.ComfyNode):
         # AnimeTimm preprocessing is loaded alongside its model metadata. Reuse
         # it here instead of rereading preprocess.json for every execution.
         preprocess = tagger_info[2] if model_name.startswith("animetimm") else None
+
+        # Each model family exposes a single batched inference function; a single
+        # image is just a batch of one, so there is no separate per-image code path.
+        def run_batch(images):
+            if model_name.startswith("animetimm"):
+                return animetimm_tag_batch(tagger_model, images, preprocess)
+            if model_name.startswith("pixai-tagger"):
+                return pixai_tag_batch(tagger_model, images)
+            if model_name.startswith("camie-tagger-v2"):
+                return camie_tag_batch(tagger_model, images)
+            if model_name.startswith("cl-tagger-v1"):
+                return cl_tagger_v1_tag_batch(tagger_model, images)
+            if model_name.startswith("cl-tagger-v2"):
+                return cl_tagger_v2_tag_batch(tagger_model, images)
+            return wd_tag_batch(tagger_model, images)
+
         batch = [Image.fromarray(np.array(image[i] * 255, dtype=np.uint8)) for i in range(image.shape[0])]
 
-        # Detect if model supports dynamic batch from its input shape
-        can_batch = not isinstance(tagger_model.get_inputs()[0].shape[0], int) or tagger_model.get_inputs()[0].shape[0] != 1
-
-        # Run inference — batched if supported, else per-image
+        # Models with a fixed batch of 1 must be run one image at a time; models
+        # with a dynamic batch dim get the whole list in a single ONNX call.
+        batch_dim = tagger_model.get_inputs()[0].shape[0]
+        can_batch = not isinstance(batch_dim, int) or batch_dim != 1
         if can_batch and len(batch) > 1:
-            if model_name.startswith("animetimm"):
-                probs = animetimm_tag_batch(tagger_model, batch, preprocess)
-            elif model_name.startswith("pixai-tagger"):
-                probs = pixai_tag_batch(tagger_model, batch)
-            elif model_name.startswith("camie-tagger-v2"):
-                probs = camie_tag_batch(tagger_model, batch)
-            elif model_name.startswith("cl-tagger-v1"):
-                probs = cl_tagger_v1_tag_batch(tagger_model, batch)
-            elif model_name.startswith("cl-tagger-v2"):
-                probs = cl_tagger_v2_tag_batch(tagger_model, batch)
-            else:
-                probs = wd_tag_batch(tagger_model, batch)
+            probs = run_batch(batch)  # [B, n_tags]
         else:
-            probs = None  # per-image fallback
+            probs = np.stack([run_batch([img])[0] for img in batch])  # [B, n_tags]
 
         pbar = utils.ProgressBar(image.shape[0])
         tags_list, ratings_list, chara_list, general_list = [], [], [], []
 
         for i in range(image.shape[0]):
-            if probs is not None:
-                p = probs[i]
-            else:
-                img = batch[i]
-                if model_name.startswith("pixai-tagger"):
-                    p = pixai_tag(tagger_model, img)
-                elif model_name.startswith("camie-tagger-v2"):
-                    p = camie_tag(tagger_model, img)
-                elif model_name.startswith("animetimm"):
-                    p = animetimm_tag(tagger_model, img, preprocess)
-                elif model_name.startswith("cl-tagger-v1"):
-                    p = cl_tagger_v1_tag(tagger_model, img)
-                elif model_name.startswith("cl-tagger-v2"):
-                    p = cl_tagger_v2_tag(tagger_model, img)
-                else:
-                    p = wd_tag(tagger_model, img)
-
-            result = get_tag(p, tags_df, threshold,
+            result = get_tag(probs[i], tags_df, threshold,
                              character_threshold, use_best_threshold, trailing_comma, sort_tags, exclude_tags)
             tags_list.append(result["combined"])
             ratings_list.append(result["rating"])

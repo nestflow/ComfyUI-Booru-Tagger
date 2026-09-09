@@ -1,0 +1,5 @@
+{
+  "Load Booru Tagger": "Load and cache a Booru tagger model.",
+  "Booru Tagger": "Interrogate images with supported Booru tagging models and output tags with confidence filtering.",
+  "Unique Tags": "Remove duplicate tags from a comma-separated tag list while preserving order."
+}

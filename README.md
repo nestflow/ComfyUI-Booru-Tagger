@@ -61,6 +61,7 @@ Models created by:
 
 Edit `models.json` to customize defaults:
 
-- **`settings.ortProviders`** — ONNX Runtime execution providers. GPU is auto-detected.
+- **`settings.ortProviders`** — ONNX Runtime execution providers. Providers that the installed `onnxruntime` build does not ship are dropped automatically (with a warning).
+- **`settings.preprocess`** — `"tensor"` (default) resizes/pads/normalises on the GPU straight from ComfyUI's image tensor; `"pil"` restores the original CPU/PIL path (same tags, ~13 ms slower per image).
 - **`threshold` / `character_threshold`** — Per-model default thresholds.
 - **`HF_ENDPOINT`** — Mirror/proxy URL for HuggingFace downloads.

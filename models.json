@@ -7,6 +7,7 @@
 		"character_threshold": 0.85,
 		"exclude_tags": "",
 		"ortProviders": ["CUDAExecutionProvider", "CPUExecutionProvider"],
+		"preprocess": "tensor",
 		"HF_ENDPOINT": "https://huggingface.co"
 	},
 	"model_url": {

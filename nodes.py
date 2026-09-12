@@ -11,8 +11,9 @@ from typing_extensions import override
 from comfy import utils
 import pandas as pd
 import json
-import torchvision.transforms as transforms
 import torch
+import torch.nn.functional as F
+import torchvision.transforms as transforms
 
 config = get_extension_config()
 known_models = list(config.get("model_url", {}).keys())
@@ -29,8 +30,16 @@ defaults = {
     "trailing_comma": False,
     "exclude_tags": "",
     "HF_ENDPOINT": "https://huggingface.co",
+    # "tensor" resizes/pads/normalises on the GPU straight from ComfyUI's IMAGE
+    # tensor; "pil" is the original PIL path over PIL-resized images.
+    "preprocess": "tensor",
 }
 defaults.update(config.get("settings", {}))
+
+_PREPROCESS = defaults["preprocess"]
+if _PREPROCESS not in ("tensor", "pil"):
+    log(f"Unknown settings.preprocess {_PREPROCESS!r}, using 'tensor'", "WARN", True)
+    _PREPROCESS = "tensor"
 
 # Guard against a stale default model (e.g. settings.model was removed from
 # model_url during a config edit): fall back to the first configured model.
@@ -54,7 +63,20 @@ _ORT_PRIORITY = [
     "OpenVINOExecutionProvider",
     "CPUExecutionProvider",
 ]
-defaults["ortProviders"] = [p for p in _ORT_PRIORITY if p in available_providers and p not in _ORT_BLOCKLIST]
+# A user-provided provider list is honoured, but only for providers this
+# onnxruntime build actually ships; a setting that was copy-pasted onto a
+# machine without that EP used to fail at InferenceSession() time.
+_configured_providers = config.get("settings", {}).get("ortProviders")
+if _configured_providers:
+    _unknown = [p for p in _configured_providers if p not in available_providers]
+    if _unknown:
+        log(f"Configured ORT providers are not available in this onnxruntime build and were "
+            f"ignored: {', '.join(_unknown)}", "WARN", True)
+    defaults["ortProviders"] = [p for p in _configured_providers
+                                if p in available_providers and p not in _ORT_BLOCKLIST]
+else:
+    defaults["ortProviders"] = [p for p in _ORT_PRIORITY
+                                if p in available_providers and p not in _ORT_BLOCKLIST]
 if not defaults["ortProviders"]:
     defaults["ortProviders"] = ["CPUExecutionProvider"]
 
@@ -124,8 +146,128 @@ def _migrate_legacy_model(model_name, dest_model, dest_meta):
         return
 
 
+# ComfyUI hands us an IMAGE tensor (float32 [B, H, W, 3] in 0..1), so each family
+# gets a `_prep_*` that stays on the tensor (GPU when it is on the GPU) plus the
+# original `*_tag_batch` PIL path, which `settings.preprocess="pil"` selects.
+# test/harness.py checks that both agree on real models.
+
+
+def _to_nchw(images: torch.Tensor) -> torch.Tensor:
+    """[B, H, W, 3] -> [B, 3, H, W] without copying when possible."""
+    if images.dim() != 4:
+        raise ValueError(f"expected a [B, H, W, C] image tensor, got {tuple(images.shape)}")
+    if images.shape[1] == 3:
+        return images
+    if images.shape[-1] == 3:
+        return images.permute(0, 3, 1, 2)
+    raise ValueError(f"could not find the channel axis in {tuple(images.shape)}")
+
+
+def _resize_shortest_side(images: torch.Tensor, target: int):
+    """Replicate PIL's `ratio = target / max(size)` letterbox geometry."""
+    h, w = images.shape[-2:]
+    ratio = float(target) / max(h, w)
+    return max(1, int(h * ratio)), max(1, int(w * ratio))
+
+
+def _find_input_layout(shape):
+    """Return (layout, height, width) for a 4-D ONNX input shape."""
+    if len(shape) != 4:
+        raise ValueError(f"expected a 4-D model input, got {shape}")
+    if shape[1] == 3:                       # NCHW
+        size = [shape[i] if isinstance(shape[i], int) else 448 for i in (2, 3)]
+        return "NCHW", size[0], size[1]
+    size = [shape[i] if isinstance(shape[i], int) else 448 for i in (1, 2)]   # NHWC
+    return "NHWC", size[0], size[1]
+
+
+def _prep_wd(images, height, width):
+    """WD taggers: NHWC BGR float32 in 0..255 on a white canvas."""
+    x = _to_nchw(images)
+    nh, nw = _resize_shortest_side(x, height)
+    x = F.interpolate(x, size=(nh, nw), mode="bicubic", align_corners=False, antialias=True)
+    x = F.pad(x, ((width - nw) // 2, width - nw - (width - nw) // 2,
+                  (height - nh) // 2, height - nh - (height - nh) // 2), value=1.0)
+    x = x.mul(255).flip(1).permute(0, 2, 3, 1).contiguous()  # RGB->BGR, NCHW->NHWC
+    return x.detach().cpu().numpy()
+
+
+def _prep_pixai(images, height, width):
+    """Pixai: [B, 3, H, W] in -1..1 on a mid-grey canvas, dataloader-style."""
+    x = _to_nchw(images)
+    nh, nw = _resize_shortest_side(x, height)
+    x = F.interpolate(x, size=(nh, nw), mode="bicubic", align_corners=False, antialias=True)
+    x = F.pad(x, ((width - nw) // 2, width - nw - (width - nw) // 2,
+                  (height - nh) // 2, height - nh - (height - nh) // 2), value=128.0 / 255.0)
+    return x.sub(0.5).div(0.5).detach().cpu().numpy()
+
+
+def _prep_camie(images, height, width):
+    """Camie: [B, 3, H, W] ImageNet-normalised on its signature grey canvas."""
+    x = _to_nchw(images)
+    nh, nw = _resize_shortest_side(x, height)
+    x = F.interpolate(x, size=(nh, nw), mode="bicubic", align_corners=False, antialias=True)
+    # The canvas is per-channel (124, 116, 104), so pad each channel separately
+    # to match Image.new("RGB", ..., (124, 116, 104)) exactly.
+    pad = ((width - nw) // 2, width - nw - (width - nw) // 2,
+           (height - nh) // 2, height - nh - (height - nh) // 2)  # l, r, t, b
+    x = F.pad(x, pad, mode="constant", value=0.0)
+    if any(pad):
+        # torch.full, not expand(): expand() is a zero-stride view and cannot be
+        # assigned into.
+        fill = torch.tensor([124, 116, 104], dtype=x.dtype, device=x.device).div(255.0)
+        canvas = fill.view(1, 3, 1, 1).expand(x.shape[0], 3, x.shape[2], x.shape[3]).contiguous()
+        y0, x0 = pad[2], pad[0]
+        canvas[:, :, y0:y0 + nh, x0:x0 + nw] = x[:, :, y0:y0 + nh, x0:x0 + nw]
+        x = canvas
+    mean = torch.tensor([0.485, 0.456, 0.406], dtype=x.dtype, device=x.device).view(1, 3, 1, 1)
+    std = torch.tensor([0.229, 0.224, 0.225], dtype=x.dtype, device=x.device).view(1, 3, 1, 1)
+    return x.sub(mean).div(std).detach().cpu().numpy()
+
+
+def _prep_cl_v2(images, height, width):
+    """CL Tagger v2: plain RGB resize to a square, -1..1, no letterboxing."""
+    x = F.interpolate(_to_nchw(images), size=(height, width),
+                      mode="bicubic", align_corners=False, antialias=True)
+    return x.sub(0.5).div(0.5).detach().cpu().numpy()
+
+
+def _prep_cl_v1(images, target_size, is_nchw):
+    """CL Tagger v1: square white letterbox, RGB, -1..1 (BGR when NCHW)."""
+    x = _to_nchw(images)
+    b, _, h, w = x.shape
+    side = max(h, w)
+    x = F.pad(x, ((side - w) // 2, side - w - (side - w) // 2,
+                  (side - h) // 2, side - h - (side - h) // 2), value=1.0)
+    x = F.interpolate(x, size=(target_size, target_size),
+                      mode="bicubic", align_corners=False, antialias=True)
+    if is_nchw:
+        x = x.flip(1)
+    else:
+        x = x.permute(0, 2, 3, 1).contiguous()
+    return x.sub(0.5).div(0.5).detach().cpu().numpy()
+
+
+def _prep_animetimm(images, pad_size, resize_size, crop_size, mean, std):
+    """AnimeTimm: white-pad to pad_size, resize, centre crop, then normalise."""
+    x = _to_nchw(images)
+    b, _, h, w = x.shape
+    if h < pad_size[0] or w < pad_size[1]:
+        x = F.pad(x, (0, max(0, pad_size[1] - w), 0, max(0, pad_size[0] - h)), value=1.0)
+    x = F.interpolate(x, size=tuple(resize_size), mode="bicubic",
+                      align_corners=False, antialias=True)
+    # torchvision's CenterCrop rounds the crop origin up; match it exactly.
+    ch, cw = crop_size
+    top = int(round((x.shape[2] - ch) / 2.0))
+    left = int(round((x.shape[3] - cw) / 2.0))
+    x = x[:, :, top:top + ch, left:left + cw]
+    mean = torch.tensor(mean, dtype=x.dtype, device=x.device).view(1, 3, 1, 1)
+    std = torch.tensor(std, dtype=x.dtype, device=x.device).view(1, 3, 1, 1)
+    return x.sub(mean).div(std).detach().cpu().numpy()
+
+
 def wd_tag_batch(wd_model: InferenceSession, images: list[Image.Image]):
-    """Run WD tagger on a batch of images in a single ONNX call."""
+    """Run WD tagger on a batch of PIL images in a single ONNX call."""
     img_input = wd_model.get_inputs()[0]
     (_, height, width, channel) = img_input.shape
 
@@ -147,7 +289,7 @@ def wd_tag_batch(wd_model: InferenceSession, images: list[Image.Image]):
 
 
 def pixai_tag_batch(pixai_model: InferenceSession, images: list[Image.Image]):
-    """Run Pixai tagger on a batch of images in a single ONNX call."""
+    """Run Pixai tagger on a batch of PIL images in a single ONNX call."""
     img_input = pixai_model.get_inputs()[0]
     (_, channel, height, width) = img_input.shape
 
@@ -172,7 +314,7 @@ def pixai_tag_batch(pixai_model: InferenceSession, images: list[Image.Image]):
 
 
 def animetimm_tag_batch(animetimm_model: InferenceSession, images: list[Image.Image], preprocess: dict):
-    """Run animetimm tagger on a batch of images in a single ONNX call."""
+    """Run animetimm tagger on a batch of PIL images in a single ONNX call."""
     steps = preprocess["test"]
     pad_step = next(s for s in steps if s["type"] == "pad_to_size")
     resize_step = next(s for s in steps if s["type"] == "resize")
@@ -215,7 +357,7 @@ def animetimm_tag_batch(animetimm_model: InferenceSession, images: list[Image.Im
 
 
 def camie_tag_batch(camie_model: InferenceSession, images: list[Image.Image]):
-    """Run Camie tagger on a batch of images in a single ONNX call."""
+    """Run Camie tagger on a batch of PIL images in a single ONNX call."""
     img_input = camie_model.get_inputs()[0]
     (_, channel, height, width) = img_input.shape
 
@@ -244,7 +386,7 @@ def camie_tag_batch(camie_model: InferenceSession, images: list[Image.Image]):
 
 
 def cl_tagger_v2_tag_batch(cl_model: InferenceSession, images: list[Image.Image]):
-    """Run CL Tagger v2 on a batch of images in a single ONNX call."""
+    """Run CL Tagger v2 on a batch of PIL images in a single ONNX call."""
     img_input = cl_model.get_inputs()[0]
     (_, channel, height, width) = img_input.shape
 
@@ -280,24 +422,14 @@ def _load_animetimm_preprocess(model_name: str) -> dict:
 
 
 def cl_tagger_v1_tag_batch(cl_model: InferenceSession, images: list[Image.Image]):
-    """Run CL Tagger v1 on a batch of images in a single ONNX call."""
+    """Run CL Tagger v1 on a batch of PIL images in a single ONNX call."""
     img_input = cl_model.get_inputs()[0]
     input_shape = img_input.shape
 
     # Detect layout: NCHW = [B, 3, H, W], NHWC = [B, H, W, 3]
-    is_nchw = len(input_shape) == 4 and input_shape[1] == 3
-
-    target_size = 448
-    if is_nchw:
-        for idx in (3, 2):
-            if isinstance(input_shape[idx], int):
-                target_size = input_shape[idx]
-                break
-    else:
-        for idx in (2, 1):
-            if isinstance(input_shape[idx], int):
-                target_size = input_shape[idx]
-                break
+    layout, size_h, size_w = _find_input_layout(input_shape)
+    is_nchw = layout == "NCHW"
+    target_size = size_h if is_nchw else size_w
 
     batch = []
     for img in images:
@@ -327,11 +459,112 @@ def cl_tagger_v1_tag_batch(cl_model: InferenceSession, images: list[Image.Image]
     return 1.0 / (1.0 + np.exp(-logits))
 
 
+# ---------------------------------------------------------------------------
+# Per-model binding: layout, preprocessing and precomputed tag-selection data.
+#
+# Everything here is derived once per session. The hot loop then only does
+# numpy indexing and string joins, with no per-image pandas work.
+# ---------------------------------------------------------------------------
+
+class ModelSpec:
+    """A loaded session bound to its preprocessing and precomputed tag tables.
+
+    Built once per execution. The per-image work is then pure numpy indexing, so
+    no DataFrame is rebuilt or re-scanned for each image.
+    """
+
+    def __init__(self, sess, df, model_name, preprocess, prep, run_mode):
+        self.sess = sess
+        self.model_name = model_name
+        self.preprocess = preprocess
+        self.prep = prep              # callable(_to_nchw(tensor)) -> model input array
+        self.run_mode = run_mode      # "plain" | "camie" | "animetimm" | "sigmoid"
+        img_input = sess.get_inputs()[0]
+        self.in_name = img_input.name
+        self.out_names = [o.name for o in sess.get_outputs()]
+
+        categories = df["category"].to_numpy() if "category" in df.columns \
+            else np.zeros(len(df), dtype=np.int64)
+        self.tags = {
+            name: np.flatnonzero(categories == cat)
+            for name, cat in (("general", 0), ("character", 4), ("rating", 1))
+        }
+        raw = df["name"].to_numpy(dtype=object)
+        self.raw_names = np.asarray(raw, dtype=object)
+        # Pre-escape so _format_tags never rebuilds the same strings per image.
+        self.escaped_names = np.asarray(
+            [str(n).replace("(", "\\(").replace(")", "\\)") for n in raw], dtype=object)
+        self.best_threshold = np.nan_to_num(
+            df["best_threshold"].to_numpy(dtype=np.float32), nan=1.0, posinf=1.0, neginf=1.0) \
+            if "best_threshold" in df.columns else None
+
+    def prepare_batch(self, images) -> np.ndarray:
+        return self._run(self.prep(_to_nchw(images)))
+
+    def prepare_pil_batch(self, images) -> np.ndarray:
+        if self.model_name.startswith("animetimm"):
+            return animetimm_tag_batch(self.sess, images, self.preprocess)
+        if self.model_name.startswith("pixai"):
+            return pixai_tag_batch(self.sess, images)
+        if self.model_name.startswith("camie"):
+            return camie_tag_batch(self.sess, images)
+        if self.model_name.startswith("cl-tagger-v2"):
+            return cl_tagger_v2_tag_batch(self.sess, images)
+        if self.model_name.startswith("cl-tagger-v1"):
+            return cl_tagger_v1_tag_batch(self.sess, images)
+        return wd_tag_batch(self.sess, images)
+
+    def _run(self, arr):
+        outs = self.sess.run(self.out_names, {self.in_name: arr})
+        if self.run_mode == "camie":
+            return outs[1]                      # the "refine" head
+        if self.run_mode == "animetimm":
+            widest = max(range(len(outs)), key=lambda i: outs[i].shape[-1])
+            logits = outs[widest]
+        else:
+            logits = outs[0]
+        return 1.0 / (1.0 + np.exp(-logits)) if self.run_mode in ("animetimm", "sigmoid") else logits
+
+
+def _build_spec(sess: InferenceSession, tagger_info) -> ModelSpec:
+    """Bind a session to its family's preprocessing and tag tables."""
+    df, model_name = tagger_info[0], tagger_info[1]
+    preprocess = tagger_info[2] if len(tagger_info) > 2 else None
+    layout, height, width = _find_input_layout(sess.get_inputs()[0].shape)
+
+    if model_name.startswith("animetimm"):
+        steps = preprocess["test"]
+        pad = tuple(next(s for s in steps if s["type"] == "pad_to_size")["size"])
+        resize = next(s for s in steps if s["type"] == "resize")["size"]
+        crop = next(s for s in steps if s["type"] == "center_crop")["size"]
+        norm = next(s for s in steps if s["type"] == "normalize")
+        return ModelSpec(sess, df, model_name, preprocess,
+                         lambda x: _prep_animetimm(x, pad, resize, crop, norm["mean"], norm["std"]),
+                         "animetimm")
+    if model_name.startswith("camie"):
+        return ModelSpec(sess, df, model_name, preprocess,
+                         lambda x: _prep_camie(x, height, width), "camie")
+    if model_name.startswith("pixai"):
+        return ModelSpec(sess, df, model_name, preprocess,
+                         lambda x: _prep_pixai(x, height, width), "plain")
+    if model_name.startswith("cl-tagger-v2"):
+        return ModelSpec(sess, df, model_name, preprocess,
+                         lambda x: _prep_cl_v2(x, height, height), "sigmoid")
+    if model_name.startswith("cl-tagger-v1"):
+        return ModelSpec(sess, df, model_name, preprocess,
+                         lambda x: _prep_cl_v1(x, height, layout == "NCHW"), "sigmoid")
+    return ModelSpec(sess, df, model_name, preprocess,
+                     lambda x: _prep_wd(x, height, width), "plain")
+
+
+def _escape(tag: str) -> str:
+    return tag.replace("(", "\\(").replace(")", "\\)")
+
+
 def _format_tags(tag_list, trailing_comma=False):
     if not tag_list:
         return ""
-    res = ("" if trailing_comma else ", ").join((tag.replace(
-        "(", "\\(").replace(")", "\\)") + (", " if trailing_comma else "") for tag in tag_list))
+    res = ("" if trailing_comma else ", ").join((tag + (", " if trailing_comma else "") for tag in tag_list))
     return res
 
 
@@ -344,6 +577,17 @@ def _pick_top_rating(df):
     return top['name']
 
 
+def _pick_top_rating_np(names, probs, idx_rating):
+    """Same as _pick_top_rating, on precomputed indices."""
+    if not len(idx_rating):
+        return ""
+    values = probs[idx_rating]
+    pos = values > 0
+    if not pos.any():
+        return ""
+    return names[idx_rating[np.argmax(np.where(pos, values, -np.inf))]]
+
+
 # Category convention for model loaders:
 #   0 = general (descriptive tags, shown in general_tags)
 #   1 = rating  (4 tags: safe/sensitive/questionable/explicit, shown in rating output)
@@ -352,32 +596,56 @@ def _pick_top_rating(df):
 #   4 = character (character/copyright/artist, shown in character_tags)
 
 
-def get_tag(probs, tags_df: pd.DataFrame, threshold=0.35, character_threshold=0.85,
+def get_tag(probs, tags_df: pd.DataFrame, spec=None, threshold=0.35, character_threshold=0.85,
             use_best_threshold=True, trailing_comma=False, sort_tags=False, exclude_tags=""):
-    df = tags_df.assign(probs=probs)
-    if sort_tags:
-        df = df.sort_values(by='probs', ascending=False)
+    """Select tags for one image.
 
-    # Optionally use AnimeTimm's per-tag best_threshold values as a floor. The
-    # user's thresholds can always raise the bar further.
-    if use_best_threshold and 'best_threshold' in df.columns:
-        best = df['best_threshold'].fillna(1.0)
-        general = df[(df['category'] == 0) & (df['probs'] >= np.maximum(best, threshold))]['name'].to_list()
-        character = df[(df['category'] == 4) & (df['probs'] >= np.maximum(best, character_threshold))]['name'].to_list()
+    `spec` carries the indices/names precomputed at load time. It is optional so
+    callers (and tests) can still pass a plain DataFrame and get the original
+    pandas behaviour.
+    """
+    if spec is None:
+        df = tags_df.assign(probs=probs)
+        if sort_tags:
+            df = df.sort_values(by='probs', ascending=False)
+        if use_best_threshold and 'best_threshold' in df.columns:
+            best = df['best_threshold'].fillna(1.0)
+            general = df[(df['category'] == 0) & (df['probs'] >= np.maximum(best, threshold))]['name'].to_list()
+            character = df[(df['category'] == 4) & (df['probs'] >= np.maximum(best, character_threshold))]['name'].to_list()
+        else:
+            general = df[(df['category'] == 0) & (df['probs'] > threshold)]['name'].to_list()
+            character = df[(df['category'] == 4) & (df['probs'] > character_threshold)]['name'].to_list()
+        rating = _pick_top_rating(df)
+        general = [_escape(t) for t in general]
+        character = [_escape(t) for t in character]
     else:
-        general = df[(df['category'] == 0) & (df['probs'] > threshold)]['name'].to_list()
-        character = df[(df['category'] == 4) & (df['probs'] > character_threshold)]['name'].to_list()
-    rating = _pick_top_rating(df)
+        idx_general = spec.tags["general"]
+        idx_character = spec.tags["character"]
+        if use_best_threshold and spec.best_threshold is not None:
+            # NaN best_threshold becomes 1.0, so `np.maximum(best, user)` keeps
+            # the user's threshold in charge exactly like `fillna(1.0)` did.
+            general = idx_general[probs[idx_general] >= np.maximum(spec.best_threshold[idx_general], threshold)]
+            character = idx_character[probs[idx_character] >= np.maximum(spec.best_threshold[idx_character], character_threshold)]
+        else:
+            general = idx_general[probs[idx_general] >= threshold]
+            character = idx_character[probs[idx_character] >= character_threshold]
+        if sort_tags:
+            # numpy's argsort is ascending; the pandas path used ascending=False.
+            general = general[np.argsort(probs[general])[::-1]]
+            character = character[np.argsort(probs[character])[::-1]]
+        rating = _pick_top_rating_np(spec.raw_names, probs, spec.tags["rating"])
+        general = spec.escaped_names[general].tolist()
+        character = spec.escaped_names[character].tolist()
 
     remove = [s.strip() for s in exclude_tags.lower().split(",")] if exclude_tags else []
+    if remove:
+        def _apply_exclude(tag_list):
+            # Escape for output, but match against the unescaped name.
+            return [_escape(t) for t in tag_list
+                    if t.replace("\\(", "(").replace("\\)", ")").lower() not in remove]
+        character = _apply_exclude(character)
+        general = _apply_exclude(general)
 
-    def _apply_exclude(tag_list):
-        if not remove:
-            return tag_list
-        return [tag for tag in tag_list if tag.lower() not in remove]
-
-    character = _apply_exclude(character)
-    general = _apply_exclude(general)
     tags = character + general
 
     return {
@@ -536,43 +804,38 @@ class BooruTagger(io.ComfyNode):
         # it here instead of rereading preprocess.json for every execution.
         preprocess = tagger_info[2] if model_name.startswith("animetimm") else None
 
-        # Each model family exposes a single batched inference function; a single
-        # image is just a batch of one, so there is no separate per-image code path.
-        def run_batch(images):
-            if model_name.startswith("animetimm"):
-                return animetimm_tag_batch(tagger_model, images, preprocess)
-            if model_name.startswith("pixai-tagger"):
-                return pixai_tag_batch(tagger_model, images)
-            if model_name.startswith("camie-tagger-v2"):
-                return camie_tag_batch(tagger_model, images)
-            if model_name.startswith("cl-tagger-v1"):
-                return cl_tagger_v1_tag_batch(tagger_model, images)
-            if model_name.startswith("cl-tagger-v2"):
-                return cl_tagger_v2_tag_batch(tagger_model, images)
-            return wd_tag_batch(tagger_model, images)
-
-        batch = [Image.fromarray(np.array(image[i] * 255, dtype=np.uint8)) for i in range(image.shape[0])]
+        # Bind layout + precomputed tag indices once per execution instead of
+        # re-deriving them for every image.
+        spec = _build_spec(tagger_model, (tags_df, model_name, preprocess))
 
         # Models with a fixed batch of 1 must be run one image at a time; models
         # with a dynamic batch dim get the whole list in a single ONNX call.
         batch_dim = tagger_model.get_inputs()[0].shape[0]
         can_batch = not isinstance(batch_dim, int) or batch_dim != 1
-        if can_batch and len(batch) > 1:
-            probs = run_batch(batch)  # [B, n_tags]
-        else:
-            probs = np.stack([run_batch([img])[0] for img in batch])  # [B, n_tags]
+        total = image.shape[0]
+        chunk = total if can_batch else 1
 
-        pbar = utils.ProgressBar(image.shape[0])
+        pbar = utils.ProgressBar(total)
+        probs = np.empty((total, len(tags_df)), dtype=np.float32)
+        for start in range(0, total, chunk):
+            stop = min(start + chunk, total)
+            if _PREPROCESS == "pil":
+                images = [Image.fromarray(np.asarray(image[i].mul(255).clamp(0, 255)
+                                                     .to(torch.uint8).cpu())) for i in range(start, stop)]
+                rows = spec.prepare_pil_batch(images)
+            else:
+                rows = spec.prepare_batch(image[start:stop])
+            probs[start:stop] = rows
+            pbar.update(stop - start)
+
         tags_list, ratings_list, chara_list, general_list = [], [], [], []
-
-        for i in range(image.shape[0]):
-            result = get_tag(probs[i], tags_df, threshold,
+        for i in range(total):
+            result = get_tag(probs[i], tags_df, spec, threshold,
                              character_threshold, use_best_threshold, trailing_comma, sort_tags, exclude_tags)
             tags_list.append(result["combined"])
             ratings_list.append(result["rating"])
             chara_list.append(result["character"])
             general_list.append(result["general"])
-            pbar.update(1)
         return io.NodeOutput(tags_list, general_list, ratings_list, chara_list)
 
 

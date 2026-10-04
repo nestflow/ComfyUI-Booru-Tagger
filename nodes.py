@@ -98,6 +98,24 @@ models_dir = folder_paths.get_folder_paths(folder_name)[0]
 # Models already warned about lacking per-tag best_threshold, so the notice is
 # logged once instead of on every execution.
 _best_threshold_warned = set()
+# Models already warned that their threshold widget is at the global default.
+_threshold_default_warned = set()
+
+
+def _build_session(name):
+    """Create an ONNX Runtime session with the configured provider/option tuning."""
+    sess_options = onnxruntime.SessionOptions()
+    sess_options.log_severity_level = 3  # Suppress provider init warnings
+    sess_options.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
+    intra_threads = defaults.get("ortIntraOpThreads", 0) or 0
+    if intra_threads > 0:
+        sess_options.intra_op_num_threads = int(intra_threads)
+    if defaults["ortProviders"][0] == "DmlExecutionProvider":
+        # DirectML is fastest without the memory pattern arena and run
+        # sequentially (see the PixAI ONNX card's DirectML notes).
+        sess_options.enable_mem_pattern = False
+        sess_options.execution_mode = onnxruntime.ExecutionMode.ORT_SEQUENTIAL
+    return InferenceSession(name, sess_options=sess_options, providers=defaults["ortProviders"])
 
 # Directories where legacy flat files may exist (v1.x used "wd14_tagger" or extension-local "models")
 _LEGACY_MODEL_DIRS = [
@@ -523,7 +541,7 @@ class ModelSpec:
     no DataFrame is rebuilt or re-scanned for each image.
     """
 
-    def __init__(self, sess, df, model_name, preprocess, prep, run_mode):
+    def __init__(self, sess, df, model_name, preprocess, prep, run_mode, replace_underscore=True):
         self.sess = sess
         self.model_name = model_name
         self.preprocess = preprocess
@@ -551,6 +569,10 @@ class ModelSpec:
             for name, cat in (("general", 0), ("character", 4), ("rating", 1))
         }
         raw = df["name"].to_numpy(dtype=object)
+        # Names are stored as-is by the loader; the underscore->space choice is
+        # made here at build time so it never forces the loader to re-run.
+        if replace_underscore:
+            raw = np.asarray([str(n).replace("_", " ") for n in raw], dtype=object)
         self.raw_names = np.asarray(raw, dtype=object)
         # Pre-escape so _format_tags never rebuilds the same strings per image.
         self.escaped_names = np.asarray(
@@ -619,7 +641,7 @@ class ModelSpec:
         return 1.0 / (1.0 + np.exp(-logits)) if self.run_mode in ("animetimm", "sigmoid") else logits
 
 
-def _build_spec(sess: InferenceSession, tagger_info) -> ModelSpec:
+def _build_spec(sess: InferenceSession, tagger_info, replace_underscore=True) -> ModelSpec:
     """Bind a session to its family's preprocessing and tag tables."""
     df, model_name = tagger_info[0], tagger_info[1]
     preprocess = tagger_info[2] if len(tagger_info) > 2 else None
@@ -634,28 +656,31 @@ def _build_spec(sess: InferenceSession, tagger_info) -> ModelSpec:
         return ModelSpec(sess, df, model_name, preprocess,
                          lambda x, as_tensor=False: _prep_animetimm(
                              x, pad, resize, crop, norm["mean"], norm["std"], as_tensor),
-                         "animetimm")
+                         "animetimm", replace_underscore)
     if model_name.startswith("camie"):
         return ModelSpec(sess, df, model_name, preprocess,
-                         lambda x, as_tensor=False: _prep_camie(x, height, width, as_tensor), "camie")
+                         lambda x, as_tensor=False: _prep_camie(x, height, width, as_tensor),
+                         "camie", replace_underscore)
     if model_name.startswith("pixai-tagger-v1"):
         # v1.0 letterboxes on black; v0.9 used mid-grey.
         return ModelSpec(sess, df, model_name, preprocess,
                          lambda x, as_tensor=False: _prep_pixai(x, height, width, 0.0, as_tensor),
-                         "plain")
+                         "plain", replace_underscore)
     if model_name.startswith("pixai"):
         return ModelSpec(sess, df, model_name, preprocess,
                          lambda x, as_tensor=False: _prep_pixai(x, height, width, as_tensor=as_tensor),
-                         "plain")
+                         "plain", replace_underscore)
     if model_name.startswith("cl-tagger-v2"):
         return ModelSpec(sess, df, model_name, preprocess,
-                         lambda x, as_tensor=False: _prep_cl_v2(x, height, height, as_tensor), "sigmoid")
+                         lambda x, as_tensor=False: _prep_cl_v2(x, height, height, as_tensor),
+                         "sigmoid", replace_underscore)
     if model_name.startswith("cl-tagger-v1"):
         return ModelSpec(sess, df, model_name, preprocess,
                          lambda x, as_tensor=False: _prep_cl_v1(x, height, layout == "NCHW", as_tensor),
-                         "sigmoid")
+                         "sigmoid", replace_underscore)
     return ModelSpec(sess, df, model_name, preprocess,
-                     lambda x, as_tensor=False: _prep_wd(x, height, width, as_tensor), "plain")
+                     lambda x, as_tensor=False: _prep_wd(x, height, width, as_tensor),
+                     "plain", replace_underscore)
 
 
 def _escape(tag: str) -> str:
@@ -866,6 +891,25 @@ async def download_model(model: str) -> None:
             raise
 
 
+def _resolve_threshold(value, model_name, key, default_value, label):
+    """Fall back to the model's configured threshold when the widget is untouched.
+
+    If the loader's threshold output was not wired, the node's input sits at the
+    global default and would silently mis-threshold most models; in that case
+    (and only then) use the value from models.json.
+    """
+    configured = config.get(key, {}).get(model_name)
+    if configured is not None and value is not None \
+            and abs(value - default_value) < 1e-9 and configured != value:
+        if model_name not in _threshold_default_warned:
+            _threshold_default_warned.add(model_name)
+            log(f"{model_name}: {label} is at the global default {value}; using the "
+                f"model's configured {configured}. Wire the loader's {label} output "
+                f"or set the input to override.", "WARN", True)
+        return configured
+    return value
+
+
 class BooruTagger(io.ComfyNode):
     @classmethod
     def define_schema(cls) -> io.Schema:
@@ -893,6 +937,9 @@ class BooruTagger(io.ComfyNode):
                              tooltip="Split the image batch into ONNX calls of at most "
                                      "this many images. 0 sends the whole batch in one "
                                      "call (may use a lot of VRAM on large models)."),
+                io.Boolean.Input("replace_underscore",
+                                 default=defaults["replace_underscore"],
+                                 tooltip="Report tags with spaces instead of underscores."),
             ],
             outputs=[
                 io.String.Output("tags", is_output_list=True),
@@ -905,16 +952,20 @@ class BooruTagger(io.ComfyNode):
     @classmethod
     def execute(cls, tagger_model, tagger_info, image, threshold, character_threshold,
                 use_best_threshold=True, trailing_comma=False, sort_tags=False, exclude_tags="",
-                chunk_size=0) -> io.NodeOutput:
+                chunk_size=0, replace_underscore=True) -> io.NodeOutput:
         tags_df = tagger_info[0]
         model_name = tagger_info[1]
         # AnimeTimm preprocessing is loaded alongside its model metadata. Reuse
         # it here instead of rereading preprocess.json for every execution.
         preprocess = tagger_info[2] if model_name.startswith("animetimm") else None
 
+        threshold = _resolve_threshold(threshold, model_name, "threshold", defaults["threshold"], "threshold")
+        character_threshold = _resolve_threshold(
+            character_threshold, model_name, "character_threshold", defaults["character_threshold"], "character_threshold")
+
         # Bind layout + precomputed tag indices once per execution instead of
         # re-deriving them for every image.
-        spec = _build_spec(tagger_model, (tags_df, model_name, preprocess))
+        spec = _build_spec(tagger_model, (tags_df, model_name, preprocess), replace_underscore)
         if use_best_threshold and spec.best_threshold is None and model_name not in _best_threshold_warned:
             _best_threshold_warned.add(model_name)
             log(f"{model_name} has no per-tag best_threshold data; "
@@ -963,8 +1014,6 @@ class LoadBooruTaggerModel(io.ComfyNode):
             inputs=[
                 io.Combo.Input("model_name", options=models,
                                default=defaults["model"]),
-                io.Boolean.Input("replace_underscore",
-                                 default=defaults["replace_underscore"]),
             ],
             outputs=[
                 io.Custom("TAGGER_MODEL").Output("tagger_model"),
@@ -975,7 +1024,7 @@ class LoadBooruTaggerModel(io.ComfyNode):
         )
 
     @classmethod
-    async def execute(cls, model_name, replace_underscore) -> io.NodeOutput:
+    async def execute(cls, model_name) -> io.NodeOutput:
         # Get paths directly from models.json config to avoid scanning guessworks
         rel_model_path = config["model_path"].get(model_name)
         if not rel_model_path:
@@ -1001,18 +1050,7 @@ class LoadBooruTaggerModel(io.ComfyNode):
         if needs_download:
             await download_model(model_name)
 
-        sess_options = onnxruntime.SessionOptions()
-        sess_options.log_severity_level = 3  # Suppress provider init warnings
-        sess_options.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
-        intra_threads = defaults.get("ortIntraOpThreads", 0) or 0
-        if intra_threads > 0:
-            sess_options.intra_op_num_threads = int(intra_threads)
-        if defaults["ortProviders"][0] == "DmlExecutionProvider":
-            # DirectML is fastest without the memory pattern arena and run
-            # sequentially (see the PixAI ONNX card's DirectML notes).
-            sess_options.enable_mem_pattern = False
-            sess_options.execution_mode = onnxruntime.ExecutionMode.ORT_SEQUENTIAL
-        model = InferenceSession(name, sess_options=sess_options, providers=defaults["ortProviders"])
+        model = _build_session(name)
 
         threshold = config["threshold"].get(model_name, defaults["threshold"])
         character_threshold = config["character_threshold"].get(model_name, defaults["character_threshold"])
@@ -1041,8 +1079,6 @@ class LoadBooruTaggerModel(io.ComfyNode):
             else:
                 # Remap WD rating tags from category 9 -> 1 (rating)
                 df.loc[df['category'] == 9, 'category'] = 1
-            if replace_underscore:
-                df["name"] = df["name"].str.replace("_", " ")
             preprocess = _load_animetimm_preprocess(model_name) if model_name.startswith("animetimm") else None
             return io.NodeOutput(model, (df, model_name, preprocess), threshold, character_threshold)
             
@@ -1061,8 +1097,6 @@ class LoadBooruTaggerModel(io.ComfyNode):
                 }
                 df["category"] = df["category_name"].map(
                     lambda c: _cat_map_camie.get(c, 0))
-            if replace_underscore:
-                df["name"] = df["name"].str.replace("_", " ")
             return io.NodeOutput(model, (df, model_name), threshold, character_threshold)
             
         elif model_name.startswith("cl-tagger-v1") and meta_path.endswith(".json"):
@@ -1098,8 +1132,6 @@ class LoadBooruTaggerModel(io.ComfyNode):
 
                 df["name"] = tag_names
                 df["category"] = tag_cats
-            if replace_underscore:
-                df["name"] = df["name"].str.replace("_", " ")
             return io.NodeOutput(model, (df, model_name), threshold, character_threshold)
             
         elif model_name.startswith("cl-tagger-v2") and meta_path.endswith(".json"):
@@ -1126,8 +1158,6 @@ class LoadBooruTaggerModel(io.ComfyNode):
 
                 df["name"] = tag_names
                 df["category"] = tag_cats
-            if replace_underscore:
-                df["name"] = df["name"].str.replace("_", " ")
             return io.NodeOutput(model, (df, model_name), threshold, character_threshold)
         else:
             log("No compatible tag data parser found for this model.")

@@ -1,6 +1,7 @@
 from comfy_api.latest import ComfyExtension, io
 import numpy as np
 import os
+import shutil
 import aiohttp
 import folder_paths
 import onnxruntime
@@ -38,6 +39,8 @@ defaults = {
     # provider is CUDA/ROCm and torch can build CUDA tensors; falls back to the
     # plain numpy path otherwise or on any error.
     "ortIoBinding": True,
+    # 0 keeps ONNX Runtime's own thread default; >0 pins intra-op threads.
+    "ortIntraOpThreads": 0,
 }
 defaults.update(config.get("settings", {}))
 
@@ -92,6 +95,10 @@ if not os.path.exists(target_folder_path):
 folder_paths.add_model_folder_path(folder_name, target_folder_path)
 models_dir = folder_paths.get_folder_paths(folder_name)[0]
 
+# Models already warned about lacking per-tag best_threshold, so the notice is
+# logged once instead of on every execution.
+_best_threshold_warned = set()
+
 # Directories where legacy flat files may exist (v1.x used "wd14_tagger" or extension-local "models")
 _LEGACY_MODEL_DIRS = [
     os.path.join(folder_paths.models_dir, "wd14_tagger"),
@@ -130,13 +137,13 @@ def _migrate_legacy_model(model_name, dest_model, dest_meta):
 
         os.makedirs(os.path.dirname(dest_model), exist_ok=True)
         if not os.path.exists(dest_model):
-            os.rename(legacy_model, dest_model)
+            shutil.move(legacy_model, dest_model)
 
         for legacy_meta in (legacy_csv, legacy_json):
             if os.path.exists(legacy_meta):
                 os.makedirs(os.path.dirname(dest_meta), exist_ok=True)
                 if not os.path.exists(dest_meta):
-                    os.rename(legacy_meta, dest_meta)
+                    shutil.move(legacy_meta, dest_meta)
                 break
 
         # Migrate preprocess.json if present (animetimm models)
@@ -145,7 +152,7 @@ def _migrate_legacy_model(model_name, dest_model, dest_meta):
             dest_preprocess = os.path.join(models_dir, preprocess_path)
             os.makedirs(os.path.dirname(dest_preprocess), exist_ok=True)
             if not os.path.exists(dest_preprocess):
-                os.rename(legacy_preprocess, dest_preprocess)
+                shutil.move(legacy_preprocess, dest_preprocess)
 
         log(f"Migrated legacy files for {model_name} from {legacy_dir} to nested layout", "INFO", True)
         return
@@ -874,7 +881,9 @@ class BooruTagger(io.ComfyNode):
                 io.Float.Input("character_threshold",
                                min=0.0, max=1.0, step=0.05, default=defaults["character_threshold"]),
                 io.Boolean.Input("use_best_threshold", default=True,
-                                 tooltip="Use AnimeTimm's per-tag best_threshold values as minimum thresholds."),
+                                 tooltip="Use each model's per-tag best_threshold values as "
+                                         "minimum thresholds (AnimeTimm, Pixai Tagger v1.0). "
+                                         "Ignored by models without that data."),
                 io.Boolean.Input("trailing_comma",
                                  default=defaults["trailing_comma"]),
                 io.Boolean.Input("sort_tags", default=False),
@@ -906,6 +915,10 @@ class BooruTagger(io.ComfyNode):
         # Bind layout + precomputed tag indices once per execution instead of
         # re-deriving them for every image.
         spec = _build_spec(tagger_model, (tags_df, model_name, preprocess))
+        if use_best_threshold and spec.best_threshold is None and model_name not in _best_threshold_warned:
+            _best_threshold_warned.add(model_name)
+            log(f"{model_name} has no per-tag best_threshold data; "
+                f"use_best_threshold has no effect for it.", "WARN", True)
 
         # Models with a fixed batch of 1 must be run one image at a time; models
         # with a dynamic batch dim get the whole list in a single ONNX call.
@@ -990,6 +1003,15 @@ class LoadBooruTaggerModel(io.ComfyNode):
 
         sess_options = onnxruntime.SessionOptions()
         sess_options.log_severity_level = 3  # Suppress provider init warnings
+        sess_options.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
+        intra_threads = defaults.get("ortIntraOpThreads", 0) or 0
+        if intra_threads > 0:
+            sess_options.intra_op_num_threads = int(intra_threads)
+        if defaults["ortProviders"][0] == "DmlExecutionProvider":
+            # DirectML is fastest without the memory pattern arena and run
+            # sequentially (see the PixAI ONNX card's DirectML notes).
+            sess_options.enable_mem_pattern = False
+            sess_options.execution_mode = onnxruntime.ExecutionMode.ORT_SEQUENTIAL
         model = InferenceSession(name, sess_options=sess_options, providers=defaults["ortProviders"])
 
         threshold = config["threshold"].get(model_name, defaults["threshold"])

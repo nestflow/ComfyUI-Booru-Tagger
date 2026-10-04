@@ -33,6 +33,11 @@ defaults = {
     # "tensor" resizes/pads/normalises on the GPU straight from ComfyUI's IMAGE
     # tensor; "pil" is the original PIL path over PIL-resized images.
     "preprocess": "tensor",
+    # Feed the ONNX session straight from the (CUDA) preprocessed tensor via
+    # ORT IO binding, skipping the host round-trip. Only used when the active
+    # provider is CUDA/ROCm and torch can build CUDA tensors; falls back to the
+    # plain numpy path otherwise or on any error.
+    "ortIoBinding": True,
 }
 defaults.update(config.get("settings", {}))
 
@@ -181,7 +186,17 @@ def _find_input_layout(shape):
     return "NHWC", size[0], size[1]
 
 
-def _prep_wd(images, height, width):
+def _finish(x, as_tensor):
+    """Return the preprocessed batch as a tensor, or as a host numpy array.
+
+    `as_tensor=True` keeps it on its device (used by the IO-binding path);
+    the default `False` flattens to numpy for `sess.run`.
+    """
+    x = x.detach()
+    return x if as_tensor else x.cpu().numpy()
+
+
+def _prep_wd(images, height, width, as_tensor=False):
     """WD taggers: NHWC BGR float32 in 0..255 on a white canvas."""
     x = _to_nchw(images)
     nh, nw = _resize_shortest_side(x, height)
@@ -189,20 +204,20 @@ def _prep_wd(images, height, width):
     x = F.pad(x, ((width - nw) // 2, width - nw - (width - nw) // 2,
                   (height - nh) // 2, height - nh - (height - nh) // 2), value=1.0)
     x = x.mul(255).flip(1).permute(0, 2, 3, 1).contiguous()  # RGB->BGR, NCHW->NHWC
-    return x.detach().cpu().numpy()
+    return _finish(x, as_tensor)
 
 
-def _prep_pixai(images, height, width, pad_value=128.0 / 255.0):
+def _prep_pixai(images, height, width, pad_value=128.0 / 255.0, as_tensor=False):
     """Pixai: [B, 3, H, W] in -1..1 on a grey (v0.9) or black (v1.0) canvas."""
     x = _to_nchw(images)
     nh, nw = _resize_shortest_side(x, height)
     x = F.interpolate(x, size=(nh, nw), mode="bicubic", align_corners=False, antialias=True)
     x = F.pad(x, ((width - nw) // 2, width - nw - (width - nw) // 2,
                   (height - nh) // 2, height - nh - (height - nh) // 2), value=pad_value)
-    return x.sub(0.5).div(0.5).detach().cpu().numpy()
+    return _finish(x.sub(0.5).div(0.5), as_tensor)
 
 
-def _prep_camie(images, height, width):
+def _prep_camie(images, height, width, as_tensor=False):
     """Camie: [B, 3, H, W] ImageNet-normalised on its signature grey canvas."""
     x = _to_nchw(images)
     nh, nw = _resize_shortest_side(x, height)
@@ -222,17 +237,17 @@ def _prep_camie(images, height, width):
         x = canvas
     mean = torch.tensor([0.485, 0.456, 0.406], dtype=x.dtype, device=x.device).view(1, 3, 1, 1)
     std = torch.tensor([0.229, 0.224, 0.225], dtype=x.dtype, device=x.device).view(1, 3, 1, 1)
-    return x.sub(mean).div(std).detach().cpu().numpy()
+    return _finish(x.sub(mean).div(std), as_tensor)
 
 
-def _prep_cl_v2(images, height, width):
+def _prep_cl_v2(images, height, width, as_tensor=False):
     """CL Tagger v2: plain RGB resize to a square, -1..1, no letterboxing."""
     x = F.interpolate(_to_nchw(images), size=(height, width),
                       mode="bicubic", align_corners=False, antialias=True)
-    return x.sub(0.5).div(0.5).detach().cpu().numpy()
+    return _finish(x.sub(0.5).div(0.5), as_tensor)
 
 
-def _prep_cl_v1(images, target_size, is_nchw):
+def _prep_cl_v1(images, target_size, is_nchw, as_tensor=False):
     """CL Tagger v1: square white letterbox, RGB, -1..1 (BGR when NCHW)."""
     x = _to_nchw(images)
     b, _, h, w = x.shape
@@ -245,10 +260,10 @@ def _prep_cl_v1(images, target_size, is_nchw):
         x = x.flip(1)
     else:
         x = x.permute(0, 2, 3, 1).contiguous()
-    return x.sub(0.5).div(0.5).detach().cpu().numpy()
+    return _finish(x.sub(0.5).div(0.5), as_tensor)
 
 
-def _prep_animetimm(images, pad_size, resize_size, crop_size, mean, std):
+def _prep_animetimm(images, pad_size, resize_size, crop_size, mean, std, as_tensor=False):
     """AnimeTimm: white-pad to pad_size, resize, centre crop, then normalise."""
     x = _to_nchw(images)
     b, _, h, w = x.shape
@@ -263,7 +278,7 @@ def _prep_animetimm(images, pad_size, resize_size, crop_size, mean, std):
     x = x[:, :, top:top + ch, left:left + cw]
     mean = torch.tensor(mean, dtype=x.dtype, device=x.device).view(1, 3, 1, 1)
     std = torch.tensor(std, dtype=x.dtype, device=x.device).view(1, 3, 1, 1)
-    return x.sub(mean).div(std).detach().cpu().numpy()
+    return _finish(x.sub(mean).div(std), as_tensor)
 
 
 def wd_tag_batch(wd_model: InferenceSession, images: list[Image.Image]):
@@ -505,11 +520,22 @@ class ModelSpec:
         self.sess = sess
         self.model_name = model_name
         self.preprocess = preprocess
-        self.prep = prep              # callable(_to_nchw(tensor)) -> model input array
+        # callable(_to_nchw(tensor), as_tensor=False) -> model input (numpy or tensor)
+        self.prep = prep
         self.run_mode = run_mode      # "plain" | "camie" | "animetimm" | "sigmoid"
         img_input = sess.get_inputs()[0]
         self.in_name = img_input.name
         self.out_names = [o.name for o in sess.get_outputs()]
+
+        # IO binding is only worth it when preprocessing already runs on the same
+        # CUDA device ORT uses; otherwise the host round-trip still happens.
+        self._io = None
+        self.torch_device = None
+        if defaults.get("ortIoBinding", True) \
+                and defaults["ortProviders"][0] in ("CUDAExecutionProvider", "ROCMExecutionProvider") \
+                and torch.cuda.is_available():
+            self.torch_device = torch.device("cuda:0")
+            self._io = ("cuda", 0)
 
         categories = df["category"].to_numpy() if "category" in df.columns \
             else np.zeros(len(df), dtype=np.int64)
@@ -527,7 +553,37 @@ class ModelSpec:
             if "best_threshold" in df.columns else None
 
     def prepare_batch(self, images) -> np.ndarray:
-        return self._run(self.prep(_to_nchw(images)))
+        x = _to_nchw(images)
+        if self._io is not None:
+            try:
+                return self._run_io(x)
+            except Exception as err:  # noqa: BLE001 - any binding failure falls back
+                log(f"ORT IO binding unavailable for {self.model_name}, "
+                    f"using the CPU path: {err}", "WARN", True)
+                self._io = None
+                self.torch_device = None
+        arr = self.prep(x, as_tensor=False)
+        return self._postprocess(self.sess.run(self.out_names, {self.in_name: arr}))
+
+    def _run_io(self, x):
+        """Preprocess on the CUDA device and feed ORT via IO binding.
+
+        The input buffer is the torch tensor itself, so ORT reads it in place;
+        outputs are bound to host memory, which is all we need downstream.
+        """
+        device_type, device_id = self._io
+        x = x.to(self.torch_device, non_blocking=True)
+        t = self.prep(x, as_tensor=True).contiguous()
+        binding = self.sess.io_binding()
+        binding.bind_input(self.in_name, device_type=device_type, device_id=device_id,
+                           element_type=np.float32, shape=tuple(t.shape),
+                           buffer_ptr=t.data_ptr())
+        for name in self.out_names:
+            binding.bind_output(name, "cpu")
+        self.sess.run_with_iobinding(binding)
+        outs = [o.numpy() for o in binding.get_outputs()]
+        binding.clear_binding_outputs()
+        return self._postprocess(outs)
 
     def prepare_pil_batch(self, images) -> np.ndarray:
         if self.model_name.startswith("animetimm"):
@@ -544,8 +600,8 @@ class ModelSpec:
             return cl_tagger_v1_tag_batch(self.sess, images)
         return wd_tag_batch(self.sess, images)
 
-    def _run(self, arr):
-        outs = self.sess.run(self.out_names, {self.in_name: arr})
+    def _postprocess(self, outs):
+        """Pick the tag logits from a session's outputs and normalise them."""
         if self.run_mode == "camie":
             return outs[1]                      # the "refine" head
         if self.run_mode == "animetimm":
@@ -569,26 +625,30 @@ def _build_spec(sess: InferenceSession, tagger_info) -> ModelSpec:
         crop = next(s for s in steps if s["type"] == "center_crop")["size"]
         norm = next(s for s in steps if s["type"] == "normalize")
         return ModelSpec(sess, df, model_name, preprocess,
-                         lambda x: _prep_animetimm(x, pad, resize, crop, norm["mean"], norm["std"]),
+                         lambda x, as_tensor=False: _prep_animetimm(
+                             x, pad, resize, crop, norm["mean"], norm["std"], as_tensor),
                          "animetimm")
     if model_name.startswith("camie"):
         return ModelSpec(sess, df, model_name, preprocess,
-                         lambda x: _prep_camie(x, height, width), "camie")
+                         lambda x, as_tensor=False: _prep_camie(x, height, width, as_tensor), "camie")
     if model_name.startswith("pixai-tagger-v1"):
         # v1.0 letterboxes on black; v0.9 used mid-grey.
         return ModelSpec(sess, df, model_name, preprocess,
-                         lambda x: _prep_pixai(x, height, width, 0.0), "plain")
+                         lambda x, as_tensor=False: _prep_pixai(x, height, width, 0.0, as_tensor),
+                         "plain")
     if model_name.startswith("pixai"):
         return ModelSpec(sess, df, model_name, preprocess,
-                         lambda x: _prep_pixai(x, height, width), "plain")
+                         lambda x, as_tensor=False: _prep_pixai(x, height, width, as_tensor=as_tensor),
+                         "plain")
     if model_name.startswith("cl-tagger-v2"):
         return ModelSpec(sess, df, model_name, preprocess,
-                         lambda x: _prep_cl_v2(x, height, height), "sigmoid")
+                         lambda x, as_tensor=False: _prep_cl_v2(x, height, height, as_tensor), "sigmoid")
     if model_name.startswith("cl-tagger-v1"):
         return ModelSpec(sess, df, model_name, preprocess,
-                         lambda x: _prep_cl_v1(x, height, layout == "NCHW"), "sigmoid")
+                         lambda x, as_tensor=False: _prep_cl_v1(x, height, layout == "NCHW", as_tensor),
+                         "sigmoid")
     return ModelSpec(sess, df, model_name, preprocess,
-                     lambda x: _prep_wd(x, height, width), "plain")
+                     lambda x, as_tensor=False: _prep_wd(x, height, width, as_tensor), "plain")
 
 
 def _escape(tag: str) -> str:

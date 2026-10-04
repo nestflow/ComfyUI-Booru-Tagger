@@ -8,6 +8,7 @@
 		"exclude_tags": "",
 		"ortProviders": ["CUDAExecutionProvider", "CPUExecutionProvider"],
 		"preprocess": "tensor",
+		"ortIoBinding": true,
 		"HF_ENDPOINT": "https://huggingface.co"
 	},
 	"model_url": {

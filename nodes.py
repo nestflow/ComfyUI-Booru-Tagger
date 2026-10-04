@@ -192,13 +192,13 @@ def _prep_wd(images, height, width):
     return x.detach().cpu().numpy()
 
 
-def _prep_pixai(images, height, width):
-    """Pixai: [B, 3, H, W] in -1..1 on a mid-grey canvas, dataloader-style."""
+def _prep_pixai(images, height, width, pad_value=128.0 / 255.0):
+    """Pixai: [B, 3, H, W] in -1..1 on a grey (v0.9) or black (v1.0) canvas."""
     x = _to_nchw(images)
     nh, nw = _resize_shortest_side(x, height)
     x = F.interpolate(x, size=(nh, nw), mode="bicubic", align_corners=False, antialias=True)
     x = F.pad(x, ((width - nw) // 2, width - nw - (width - nw) // 2,
-                  (height - nh) // 2, height - nh - (height - nh) // 2), value=128.0 / 255.0)
+                  (height - nh) // 2, height - nh - (height - nh) // 2), value=pad_value)
     return x.sub(0.5).div(0.5).detach().cpu().numpy()
 
 
@@ -310,6 +310,34 @@ def pixai_tag_batch(pixai_model: InferenceSession, images: list[Image.Image]):
 
     batch_t = torch.stack(batch, dim=0).numpy()  # [B, C, H, W]
     pred_name = pixai_model.get_outputs()[2].name
+    return pixai_model.run([pred_name], {img_input.name: batch_t})[0]
+
+
+def pixai_v1_tag_batch(pixai_model: InferenceSession, images: list[Image.Image]):
+    """Run Pixai v1.0 on a batch of PIL images in a single ONNX call.
+
+    v1.0 letterboxes on a black canvas (v0.9 used mid-grey) and its single
+    output already includes the sigmoid.
+    """
+    img_input = pixai_model.get_inputs()[0]
+    (_, channel, height, width) = img_input.shape
+
+    batch = []
+    for img in images:
+        img = img.convert("RGB")
+        ratio = float(height) / max(img.size)
+        new_size = tuple(int(x * ratio) for x in img.size)
+        img = img.resize(new_size, Image.Resampling.BICUBIC)
+        new_img = Image.new("RGB", (width, height), (0, 0, 0))
+        paste_x = (width - new_size[0]) // 2
+        paste_y = (height - new_size[1]) // 2
+        new_img.paste(img, (paste_x, paste_y))
+        img_np = np.asarray(new_img, dtype=np.float32) / 255.0
+        img_np = (img_np - 0.5) / 0.5
+        batch.append(img_np.transpose(2, 0, 1))  # [C, H, W]
+
+    batch_t = np.stack(batch, axis=0)  # [B, C, H, W]
+    pred_name = pixai_model.get_outputs()[0].name
     return pixai_model.run([pred_name], {img_input.name: batch_t})[0]
 
 
@@ -504,6 +532,8 @@ class ModelSpec:
     def prepare_pil_batch(self, images) -> np.ndarray:
         if self.model_name.startswith("animetimm"):
             return animetimm_tag_batch(self.sess, images, self.preprocess)
+        if self.model_name.startswith("pixai-tagger-v1"):
+            return pixai_v1_tag_batch(self.sess, images)
         if self.model_name.startswith("pixai"):
             return pixai_tag_batch(self.sess, images)
         if self.model_name.startswith("camie"):
@@ -544,6 +574,10 @@ def _build_spec(sess: InferenceSession, tagger_info) -> ModelSpec:
     if model_name.startswith("camie"):
         return ModelSpec(sess, df, model_name, preprocess,
                          lambda x: _prep_camie(x, height, width), "camie")
+    if model_name.startswith("pixai-tagger-v1"):
+        # v1.0 letterboxes on black; v0.9 used mid-grey.
+        return ModelSpec(sess, df, model_name, preprocess,
+                         lambda x: _prep_pixai(x, height, width, 0.0), "plain")
     if model_name.startswith("pixai"):
         return ModelSpec(sess, df, model_name, preprocess,
                          lambda x: _prep_pixai(x, height, width), "plain")
@@ -901,8 +935,23 @@ class LoadBooruTaggerModel(io.ComfyNode):
 
         if (model_name.startswith("wd") or model_name.startswith("pixai") or model_name.startswith("animetimm")) and meta_path.endswith(".csv"):
             df = pd.read_csv(meta_path)
-            # Remap WD rating tags from category 9 -> 1 (rating)
-            df.loc[df['category'] == 9, 'category'] = 1
+            if model_name.startswith("pixai-tagger-v1"):
+                # v1.0 ships per-category recommended thresholds but no per-tag
+                # column. Derive best_threshold from the original category codes
+                # *before* remapping, so each source category keeps its own value
+                # (style 0.15 and copyright 0.24 would otherwise inherit the
+                # general/character values they are merged into).
+                _pixai_v1_thr = {0: 0.17, 1: 0.15, 3: 0.24, 4: 0.27, 5: 0.17, 9: 0.41}
+                df["best_threshold"] = df["category"].map(lambda c: _pixai_v1_thr.get(c, 1.0))
+                # v1.0 uses its own category codes and block order; map them onto
+                # the extension convention (0 general, 1 rating, 3 meta, 4 char):
+                #   0 general -> 0, 1 style -> 0, 3 copyright -> 4,
+                #   4 character -> 4, 5 meta -> 3, 9 rating -> 1
+                _cat_map_pixai_v1 = {0: 0, 1: 0, 3: 4, 4: 4, 5: 3, 9: 1}
+                df["category"] = df["category"].map(lambda c: _cat_map_pixai_v1.get(c, 3))
+            else:
+                # Remap WD rating tags from category 9 -> 1 (rating)
+                df.loc[df['category'] == 9, 'category'] = 1
             if replace_underscore:
                 df["name"] = df["name"].str.replace("_", " ")
             preprocess = _load_animetimm_preprocess(model_name) if model_name.startswith("animetimm") else None

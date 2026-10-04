@@ -1,16 +1,16 @@
 # ComfyUI Booru Tagger
 
-A [ComfyUI](https://github.com/comfyanonymous/ComfyUI) extension that tags images with booru tags for use in prompts. It bundles the commonly used open tagger models — [WD](https://huggingface.co/SmilingWolf), [Pixai](https://huggingface.co/deepghs/pixai-tagger-v0.9-onnx), [Camie](https://huggingface.co/Camais03/camie-tagger-v2), [CL Tagger](https://huggingface.co/cella110n) and [AnimeTimm](https://huggingface.co/animetimm) — 23 taggers in total.
+A [ComfyUI](https://github.com/comfyanonymous/ComfyUI) extension that tags images with booru tags for use in prompts. It bundles the commonly used open tagger models — [WD](https://huggingface.co/SmilingWolf), [Pixai](https://huggingface.co/pixai-labs/pixai-tagger-v1.0), [Camie](https://huggingface.co/Camais03/camie-tagger-v2), [CL Tagger](https://huggingface.co/cella110n) and [AnimeTimm](https://huggingface.co/animetimm) — 25 taggers in total.
 
 ## Features
 
-- **Model choice** — 23 taggers across WD, Pixai, Camie, CL Tagger and AnimeTimm; AnimeTimm models use 12,476-tag vocabularies. Use the one you prefer.
+- **Model choice** — 25 taggers across WD, Pixai, Camie, CL Tagger and AnimeTimm; AnimeTimm models use 12,476-tag vocabularies, Pixai v1.0 uses 30,877. Use the one you prefer.
 - **Loads once** — a model is loaded the first time it is used and kept in memory, so later images do not wait for another load.
 - **Multiple images per run** — the node accepts a batch of images and returns tags for all of them.
 - **Tag groups** — results are split into general, rating and character (character/copyright/artist) tags, with options for underscores, sorting, tag exclusions and per-model thresholds.
 - **Automatic downloads** — missing model files are downloaded on first use; gated models require a HuggingFace token (accepted once on the model page).
 
-For AnimeTimm models, **use_best_threshold** defaults to enabled and applies each tag's model-provided `best_threshold` as a minimum. Disable it to use only the node's `threshold` and `character_threshold` inputs, which is useful when you prefer higher recall. The defaults are the model author's category-level recommendations: eva02 (`0.39` / `0.61`), caformer (`0.39` / `0.47`), swinv2 (`0.41` / `0.59`), and ConvNeXtV2 Huge (`0.38` / `0.51`) for general / character tags.
+For AnimeTimm models (and Pixai Tagger v1.0, whose per-category thresholds are derived into the same column), **use_best_threshold** defaults to enabled and applies each tag's model-provided `best_threshold` as a minimum. Disable it to use only the node's `threshold` and `character_threshold` inputs, which is useful when you prefer higher recall. The defaults are the model author's category-level recommendations: eva02 (`0.39` / `0.61`), caformer (`0.39` / `0.47`), swinv2 (`0.41` / `0.59`), and ConvNeXtV2 Huge (`0.38` / `0.51`) for general / character tags.
 
 ## Outputs
 
@@ -26,7 +26,8 @@ For AnimeTimm models, **use_best_threshold** defaults to enabled and applies eac
 | Model | Parameters | Tags | Input Size | License | Gated |
 |---|---|---|---|---|---|
 | WD Series (eva02, vit, swinv2, etc.) | varies | varies | 448² | MIT | No |
-| Pixai Tagger v0.9 | — | 13,461 | 448² | Apache-2.0 | No |
+| Pixai Tagger v0.9 | 317.9M | 13,461 | 448² | Apache-2.0 | No |
+| Pixai Tagger v1.0 (FP16 / FP32) | 486.3M | 30,877 | 1008² | Apache-2.0 | No |
 | Camie Tagger v2 | — | 70,527 | 512² | ? | No |
 | CL Tagger v1 (1.00 / 1.01 / 1.02) | — | 42,163 | 448² | Apache-2.0 | No |
 | CL Tagger v2 (2.00 / 2.01a) | — | 106,536 / 108,036 | 384² | Custom | **Yes** |
@@ -36,6 +37,8 @@ For AnimeTimm models, **use_best_threshold** defaults to enabled and applies eac
 | AnimeTimm ConvNeXtV2 Huge (community ONNX) | 692.6M | 12,476 | 512² | GPL-3.0 | **Yes** |
 
 > ConvNeXtV2 Huge uses the community ONNX conversion from [itterative](https://huggingface.co/itterative/convnextv2_huge.dbv4-full-onnx), with official AnimeTimm metadata and preprocessing.
+
+> Pixai Tagger v1.0 uses the community ONNX conversion from [Mexes](https://huggingface.co/Mexes/pixai-tagger-v1.0-onnx-fp32-fp16-int8) (FP16 recommended for GPU, FP32 for CPU/compatibility). Its `style` tags are reported under `general_tags`, and `copyright` under `character_tags`. The model's per-category recommended thresholds (general `0.17`, style `0.15`, copyright `0.24`, character `0.27`, rating `0.41`) are applied as per-tag `best_threshold` values when **use_best_threshold** is enabled (default), so style/copyright keep their own values instead of inheriting the general/character thresholds they are grouped with.
 
 > **Gated models require a HuggingFace token.** Accept the license on the model page, then either run `huggingface-cli login` or set the `HF_TOKEN` environment variable before first download.
 

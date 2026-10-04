@@ -647,8 +647,8 @@ def get_tag(probs, tags_df: pd.DataFrame, spec=None, threshold=0.35, character_t
             general = df[(df['category'] == 0) & (df['probs'] >= np.maximum(best, threshold))]['name'].to_list()
             character = df[(df['category'] == 4) & (df['probs'] >= np.maximum(best, character_threshold))]['name'].to_list()
         else:
-            general = df[(df['category'] == 0) & (df['probs'] > threshold)]['name'].to_list()
-            character = df[(df['category'] == 4) & (df['probs'] > character_threshold)]['name'].to_list()
+            general = df[(df['category'] == 0) & (df['probs'] >= threshold)]['name'].to_list()
+            character = df[(df['category'] == 4) & (df['probs'] >= character_threshold)]['name'].to_list()
         rating = _pick_top_rating(df)
         general = [_escape(t) for t in general]
         character = [_escape(t) for t in character]
@@ -820,6 +820,10 @@ class BooruTagger(io.ComfyNode):
                 io.Boolean.Input("sort_tags", default=False),
                 io.String.Input(
                     "exclude_tags", default=defaults["exclude_tags"], multiline=True),
+                io.Int.Input("chunk_size", default=0, min=0, max=64,
+                             tooltip="Split the image batch into ONNX calls of at most "
+                                     "this many images. 0 sends the whole batch in one "
+                                     "call (may use a lot of VRAM on large models)."),
             ],
             outputs=[
                 io.String.Output("tags", is_output_list=True),
@@ -831,7 +835,8 @@ class BooruTagger(io.ComfyNode):
 
     @classmethod
     def execute(cls, tagger_model, tagger_info, image, threshold, character_threshold,
-                use_best_threshold=True, trailing_comma=False, sort_tags=False, exclude_tags="") -> io.NodeOutput:
+                use_best_threshold=True, trailing_comma=False, sort_tags=False, exclude_tags="",
+                chunk_size=0) -> io.NodeOutput:
         tags_df = tagger_info[0]
         model_name = tagger_info[1]
         # AnimeTimm preprocessing is loaded alongside its model metadata. Reuse
@@ -848,6 +853,8 @@ class BooruTagger(io.ComfyNode):
         can_batch = not isinstance(batch_dim, int) or batch_dim != 1
         total = image.shape[0]
         chunk = total if can_batch else 1
+        if can_batch and chunk_size and chunk_size > 0:
+            chunk = min(chunk, chunk_size)
 
         pbar = utils.ProgressBar(total)
         probs = np.empty((total, len(tags_df)), dtype=np.float32)
@@ -1061,14 +1068,12 @@ class UniqueTags(io.ComfyNode):
 
     @classmethod
     def execute(cls, input_tags) -> io.NodeOutput:
-        unique_tags = []
+        unique_tags = {}
         for tag in input_tags.split(','):
             tag = tag.strip()
-            if len(tag) > 0 and tag not in unique_tags:
-                unique_tags.append(tag)
-
-        unique_tags = ', '.join(unique_tags)
-        return io.NodeOutput(unique_tags)
+            if tag:
+                unique_tags.setdefault(tag, None)
+        return io.NodeOutput(', '.join(unique_tags))
 
 
 class BooruTaggerExtension(ComfyExtension):

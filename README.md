@@ -6,7 +6,7 @@ A [ComfyUI](https://github.com/comfyanonymous/ComfyUI) extension that tags image
 
 - **Model choice** — 25 taggers across WD, Pixai, Camie, CL Tagger and AnimeTimm; AnimeTimm models use 12,476-tag vocabularies, Pixai v1.0 uses 30,877. Use the one you prefer.
 - **Loads once** — a model is loaded the first time it is used and kept in memory, so later images do not wait for another load.
-- **Multiple images per run** — the node accepts a batch of images and returns tags for all of them.
+- **Multiple images per run** — the node accepts a batch of images and returns tags for all of them. Set `chunk_size` to cap how many images go through the model in one call (0 = all at once), which helps avoid running out of VRAM on large models like Pixai v1.0.
 - **Tag groups** — results are split into general, rating and character (character/copyright/artist) tags, with options for underscores, sorting, tag exclusions and per-model thresholds.
 - **Automatic downloads** — missing model files are downloaded on first use; gated models require a HuggingFace token (accepted once on the model page).
 

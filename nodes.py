@@ -12,6 +12,7 @@ from typing_extensions import override
 from comfy import utils
 import pandas as pd
 import json
+from urllib.parse import urlparse
 import torch
 import torch.nn.functional as F
 import torchvision.transforms as transforms
@@ -193,11 +194,19 @@ def _to_nchw(images: torch.Tensor) -> torch.Tensor:
     raise ValueError(f"could not find the channel axis in {tuple(images.shape)}")
 
 
-def _resize_shortest_side(images: torch.Tensor, target: int):
+def _fit_longest_side(images: torch.Tensor, target: int):
     """Replicate PIL's `ratio = target / max(size)` letterbox geometry."""
     h, w = images.shape[-2:]
     ratio = float(target) / max(h, w)
     return max(1, int(h * ratio)), max(1, int(w * ratio))
+
+
+def _pad_square(x: torch.Tensor, value: float) -> torch.Tensor:
+    """Centre on a square canvas of the longer side, like pasting onto Image.new."""
+    h, w = x.shape[-2:]
+    side = max(h, w)
+    return F.pad(x, ((side - w) // 2, side - w - (side - w) // 2,
+                     (side - h) // 2, side - h - (side - h) // 2), value=value)
 
 
 def _find_input_layout(shape):
@@ -222,30 +231,30 @@ def _finish(x, as_tensor):
 
 
 def _prep_wd(images, height, width, as_tensor=False):
-    """WD taggers: NHWC BGR float32 in 0..255 on a white canvas."""
-    x = _to_nchw(images)
-    nh, nw = _resize_shortest_side(x, height)
-    x = F.interpolate(x, size=(nh, nw), mode="bicubic", align_corners=False, antialias=True)
-    x = F.pad(x, ((width - nw) // 2, width - nw - (width - nw) // 2,
-                  (height - nh) // 2, height - nh - (height - nh) // 2), value=1.0)
+    """WD taggers: white square pad, bicubic resize, NHWC BGR float32 in 0..255."""
+    x = _pad_square(_to_nchw(images), 1.0)
+    if tuple(x.shape[-2:]) != (height, width):
+        x = F.interpolate(x, size=(height, width), mode="bicubic", align_corners=False, antialias=True)
     x = x.mul(255).flip(1).permute(0, 2, 3, 1).contiguous()  # RGB->BGR, NCHW->NHWC
     return _finish(x, as_tensor)
 
 
-def _prep_pixai(images, height, width, pad_value=128.0 / 255.0, as_tensor=False):
-    """Pixai: [B, 3, H, W] in -1..1 on a grey (v0.9) or black (v1.0) canvas."""
+def _prep_pixai(images, height, width, as_tensor=False):
+    """Pixai v1.0: [B, 3, H, W] in -1..1 on a black canvas."""
     x = _to_nchw(images)
-    nh, nw = _resize_shortest_side(x, height)
+    h, w = x.shape[-2:]
+    scale = height / max(h, w)
+    nh, nw = round(h * scale), round(w * scale)
     x = F.interpolate(x, size=(nh, nw), mode="bicubic", align_corners=False, antialias=True)
     x = F.pad(x, ((width - nw) // 2, width - nw - (width - nw) // 2,
-                  (height - nh) // 2, height - nh - (height - nh) // 2), value=pad_value)
+                  (height - nh) // 2, height - nh - (height - nh) // 2), value=0.0)
     return _finish(x.sub(0.5).div(0.5), as_tensor)
 
 
 def _prep_camie(images, height, width, as_tensor=False):
     """Camie: [B, 3, H, W] ImageNet-normalised on its signature grey canvas."""
     x = _to_nchw(images)
-    nh, nw = _resize_shortest_side(x, height)
+    nh, nw = _fit_longest_side(x, height)
     x = F.interpolate(x, size=(nh, nw), mode="bicubic", align_corners=False, antialias=True)
     # The canvas is per-channel (124, 116, 104), so pad each channel separately
     # to match Image.new("RGB", ..., (124, 116, 104)) exactly.
@@ -265,37 +274,55 @@ def _prep_camie(images, height, width, as_tensor=False):
     return _finish(x.sub(mean).div(std), as_tensor)
 
 
-def _prep_cl_v2(images, height, width, as_tensor=False):
-    """CL Tagger v2: plain RGB resize to a square, -1..1, no letterboxing."""
+def _prep_squash(images, height, width, mode, as_tensor=False):
+    """CL Tagger v2 / Pixai v0.9: plain RGB resize to the input size, -1..1, no letterboxing."""
     x = F.interpolate(_to_nchw(images), size=(height, width),
-                      mode="bicubic", align_corners=False, antialias=True)
+                      mode=mode, align_corners=False, antialias=True)
     return _finish(x.sub(0.5).div(0.5), as_tensor)
 
 
-def _prep_cl_v1(images, target_size, is_nchw, as_tensor=False):
-    """CL Tagger v1: square white letterbox, RGB, -1..1 (BGR when NCHW)."""
-    x = _to_nchw(images)
-    b, _, h, w = x.shape
-    side = max(h, w)
-    x = F.pad(x, ((side - w) // 2, side - w - (side - w) // 2,
-                  (side - h) // 2, side - h - (side - h) // 2), value=1.0)
+def _prep_cl_v1(images, target_size, as_tensor=False):
+    """CL Tagger v1: square white letterbox, NCHW BGR, -1..1."""
+    x = _pad_square(_to_nchw(images), 1.0)
     x = F.interpolate(x, size=(target_size, target_size),
                       mode="bicubic", align_corners=False, antialias=True)
-    if is_nchw:
-        x = x.flip(1)
-    else:
-        x = x.permute(0, 2, 3, 1).contiguous()
-    return _finish(x.sub(0.5).div(0.5), as_tensor)
+    return _finish(x.flip(1).sub(0.5).div(0.5), as_tensor)
 
 
-def _prep_animetimm(images, pad_size, resize_size, crop_size, mean, std, as_tensor=False):
-    """AnimeTimm: white-pad to pad_size, resize, centre crop, then normalise."""
+def _animetimm_fit(h: int, w: int, pad_size):
+    """imgutils PadToSize geometry: scale (up or down) to fit inside pad_size (w, h), keeping aspect."""
+    pw, ph = pad_size
+    ratio = min(pw / w, ph / h)
+    return max(1, round(h * ratio)), max(1, round(w * ratio))
+
+
+def _animetimm_resize_size(h: int, w: int, size):
+    """torchvision Resize semantics: an int scales the shorter side, a pair is exact."""
+    if isinstance(size, int) or len(size) == 1:
+        target = size if isinstance(size, int) else size[0]
+        if h <= w:
+            return target, max(1, int(target * w / h))
+        return max(1, int(target * h / w)), target
+    return int(size[0]), int(size[1])
+
+
+def _prep_animetimm(images, pad_size, resize_size, crop_size, mean, std, as_tensor=False, pad_mode="bilinear"):
+    """AnimeTimm: imgutils PadToSize (fit inside pad_size, centre on white), resize, centre crop, normalise.
+
+    PadToSize resizes before padding, so a large non-square image is letterboxed,
+    not squashed by the following resize.
+    """
     x = _to_nchw(images)
-    b, _, h, w = x.shape
-    if h < pad_size[0] or w < pad_size[1]:
-        x = F.pad(x, (0, max(0, pad_size[1] - w), 0, max(0, pad_size[0] - h)), value=1.0)
-    x = F.interpolate(x, size=tuple(resize_size), mode="bicubic",
-                      align_corners=False, antialias=True)
+    pw, ph = pad_size  # imgutils sizes are (width, height)
+    nh, nw = _animetimm_fit(x.shape[2], x.shape[3], pad_size)
+    if (nh, nw) != tuple(x.shape[2:]):
+        x = F.interpolate(x, size=(nh, nw), mode=pad_mode, align_corners=False,
+                          antialias=pad_mode in ("bilinear", "bicubic"))
+    x = F.pad(x, ((pw - nw) // 2, pw - nw - (pw - nw) // 2,
+                  (ph - nh) // 2, ph - nh - (ph - nh) // 2), value=1.0)
+    size = _animetimm_resize_size(ph, pw, resize_size)
+    if size != (ph, pw):
+        x = F.interpolate(x, size=size, mode="bicubic", align_corners=False, antialias=True)
     # torchvision's CenterCrop rounds the crop origin up; match it exactly.
     ch, cw = crop_size
     top = int(round((x.shape[2] - ch) / 2.0))
@@ -313,13 +340,12 @@ def wd_tag_batch(wd_model: InferenceSession, images: list[Image.Image]):
 
     batch = []
     for img in images:
-        ratio = float(height) / max(img.size)
-        new_size = tuple([int(x * ratio) for x in img.size])
-        img = img.resize(new_size, Image.Resampling.LANCZOS)
-        new_img = Image.new("RGB", (height, height), (255, 255, 255))
-        paste_x = (height - new_size[0]) // 2
-        paste_y = (height - new_size[1]) // 2
-        new_img.paste(img, (paste_x, paste_y))
+        # SmilingWolf's reference: pad to a white square first, then resize.
+        side = max(img.size)
+        new_img = Image.new("RGB", (side, side), (255, 255, 255))
+        new_img.paste(img, ((side - img.width) // 2, (side - img.height) // 2))
+        if side != height:
+            new_img = new_img.resize((height, height), Image.Resampling.BICUBIC)
         img_np = np.array(new_img, dtype=np.float32)[:, :, ::-1]  # RGB -> BGR
         batch.append(img_np)
 
@@ -329,7 +355,10 @@ def wd_tag_batch(wd_model: InferenceSession, images: list[Image.Image]):
 
 
 def pixai_tag_batch(pixai_model: InferenceSession, images: list[Image.Image]):
-    """Run Pixai tagger on a batch of PIL images in a single ONNX call."""
+    """Run Pixai v0.9 on a batch of PIL images in a single ONNX call.
+
+    Matches deepghs' preprocess.json: a plain bilinear resize, no letterboxing.
+    """
     img_input = pixai_model.get_inputs()[0]
     (_, channel, height, width) = img_input.shape
 
@@ -337,18 +366,11 @@ def pixai_tag_batch(pixai_model: InferenceSession, images: list[Image.Image]):
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
     ])
-    batch = []
-    for img in images:
-        ratio = float(height) / max(img.size)
-        new_size = tuple([int(x * ratio) for x in img.size])
-        img = img.resize(new_size, Image.Resampling.LANCZOS)
-        new_img = Image.new("RGB", (height, height), (128, 128, 128))
-        paste_x = (height - new_size[0]) // 2
-        paste_y = (height - new_size[1]) // 2
-        new_img.paste(img, (paste_x, paste_y))
-        batch.append(transform(new_img))
+    batch = [transform(img.convert("RGB").resize((width, height), Image.Resampling.BILINEAR))
+             for img in images]
 
     batch_t = torch.stack(batch, dim=0).numpy()  # [B, C, H, W]
+    # Outputs are (embedding, logits, prediction); prediction includes the sigmoid.
     pred_name = pixai_model.get_outputs()[2].name
     return pixai_model.run([pred_name], {img_input.name: batch_t})[0]
 
@@ -366,7 +388,7 @@ def pixai_v1_tag_batch(pixai_model: InferenceSession, images: list[Image.Image])
     for img in images:
         img = img.convert("RGB")
         ratio = float(height) / max(img.size)
-        new_size = tuple(int(x * ratio) for x in img.size)
+        new_size = tuple(round(x * ratio) for x in img.size)
         img = img.resize(new_size, Image.Resampling.BICUBIC)
         new_img = Image.new("RGB", (width, height), (0, 0, 0))
         paste_x = (width - new_size[0]) // 2
@@ -379,6 +401,14 @@ def pixai_v1_tag_batch(pixai_model: InferenceSession, images: list[Image.Image])
     batch_t = np.stack(batch, axis=0)  # [B, C, H, W]
     pred_name = pixai_model.get_outputs()[0].name
     return pixai_model.run([pred_name], {img_input.name: batch_t})[0]
+
+
+_PIL_RESAMPLE = {
+    "nearest": Image.Resampling.NEAREST,
+    "bilinear": Image.Resampling.BILINEAR,
+    "bicubic": Image.Resampling.BICUBIC,
+    "lanczos": Image.Resampling.LANCZOS,
+}
 
 
 def animetimm_tag_batch(animetimm_model: InferenceSession, images: list[Image.Image], preprocess: dict):
@@ -401,19 +431,16 @@ def animetimm_tag_batch(animetimm_model: InferenceSession, images: list[Image.Im
         transforms.ToTensor(),
         transforms.Normalize(mean=mean, std=std)
     ])
+    pad_resample = _PIL_RESAMPLE.get(pad_step.get("interpolation", "bilinear"), Image.Resampling.BILINEAR)
     batch = []
     for img in images:
-        img_np = np.array(img.convert("RGB"))
-        h, w = img_np.shape[:2]
-        if h < pad_size[0] or w < pad_size[1]:
-            new_h = max(h, pad_size[0])
-            new_w = max(w, pad_size[1])
-            padded = np.full((new_h, new_w, 3), 255, dtype=np.uint8)
-            off_h = (new_h - h) // 2
-            off_w = (new_w - w) // 2
-            padded[off_h:off_h + h, off_w:off_w + w] = img_np
-            img = Image.fromarray(padded)
-        batch.append(transform(img))
+        # imgutils PadToSize: fit inside pad_size keeping aspect (up or down), centre on white.
+        img = img.convert("RGB")
+        nh, nw = _animetimm_fit(img.height, img.width, pad_size)
+        fitted = img.resize((nw, nh), pad_resample) if (nw, nh) != img.size else img
+        canvas = Image.new("RGB", pad_size, (255, 255, 255))
+        canvas.paste(fitted, ((pad_size[0] - nw) // 2, (pad_size[1] - nh) // 2))
+        batch.append(transform(canvas))
 
     batch_t = torch.stack(batch, dim=0).numpy()  # [B, C, H, W]
     img_input = animetimm_model.get_inputs()[0]
@@ -492,12 +519,7 @@ def _load_animetimm_preprocess(model_name: str) -> dict:
 def cl_tagger_v1_tag_batch(cl_model: InferenceSession, images: list[Image.Image]):
     """Run CL Tagger v1 on a batch of PIL images in a single ONNX call."""
     img_input = cl_model.get_inputs()[0]
-    input_shape = img_input.shape
-
-    # Detect layout: NCHW = [B, 3, H, W], NHWC = [B, H, W, 3]
-    layout, size_h, size_w = _find_input_layout(input_shape)
-    is_nchw = layout == "NCHW"
-    target_size = size_h if is_nchw else size_w
+    _, target_size, _ = _find_input_layout(img_input.shape)
 
     batch = []
     for img in images:
@@ -512,16 +534,8 @@ def cl_tagger_v1_tag_batch(cl_model: InferenceSession, images: list[Image.Image]
         img_np = img_np[:, :, ::-1]  # RGB -> BGR
         batch.append(img_np)
 
-    batch_np = np.stack(batch, axis=0)  # [B, H, W, C]
-    if is_nchw:
-        batch_np = batch_np.transpose(0, 3, 1, 2)  # [B, C, H, W]
-        mean = np.array([0.5, 0.5, 0.5], dtype=np.float32).reshape(1, 3, 1, 1)
-        std = np.array([0.5, 0.5, 0.5], dtype=np.float32).reshape(1, 3, 1, 1)
-    else:
-        mean = np.array([0.5, 0.5, 0.5], dtype=np.float32)
-        std = np.array([0.5, 0.5, 0.5], dtype=np.float32)
-
-    batch_np = (batch_np - mean) / std
+    batch_np = np.stack(batch, axis=0).transpose(0, 3, 1, 2)  # [B, C, H, W]
+    batch_np = (batch_np - 0.5) / 0.5
     logits_name = cl_model.get_outputs()[0].name
     logits = cl_model.run([logits_name], {img_input.name: batch_np})[0]
     return 1.0 / (1.0 + np.exp(-logits))
@@ -547,7 +561,7 @@ class ModelSpec:
         self.preprocess = preprocess
         # callable(_to_nchw(tensor), as_tensor=False) -> model input (numpy or tensor)
         self.prep = prep
-        self.run_mode = run_mode      # "plain" | "camie" | "animetimm" | "sigmoid"
+        self.run_mode = run_mode      # "plain" | "camie" | "pixai" | "animetimm" | "sigmoid"
         img_input = sess.get_inputs()[0]
         self.in_name = img_input.name
         self.out_names = [o.name for o in sess.get_outputs()]
@@ -603,6 +617,8 @@ class ModelSpec:
         device_type, device_id = self._io
         x = x.to(self.torch_device, non_blocking=True)
         t = self.prep(x, as_tensor=True).contiguous()
+        # ORT reads the buffer on its own CUDA stream; let torch's kernels finish first.
+        torch.cuda.current_stream(self.torch_device).synchronize()
         binding = self.sess.io_binding()
         binding.bind_input(self.in_name, device_type=device_type, device_id=device_id,
                            element_type=np.float32, shape=tuple(t.shape),
@@ -633,6 +649,8 @@ class ModelSpec:
         """Pick the tag logits from a session's outputs and normalise them."""
         if self.run_mode == "camie":
             return outs[1]                      # the "refine" head
+        if self.run_mode == "pixai":
+            return outs[2]                      # (embedding, logits, prediction)
         if self.run_mode == "animetimm":
             widest = max(range(len(outs)), key=lambda i: outs[i].shape[-1])
             logits = outs[widest]
@@ -645,38 +663,42 @@ def _build_spec(sess: InferenceSession, tagger_info, replace_underscore=True) ->
     """Bind a session to its family's preprocessing and tag tables."""
     df, model_name = tagger_info[0], tagger_info[1]
     preprocess = tagger_info[2] if len(tagger_info) > 2 else None
-    layout, height, width = _find_input_layout(sess.get_inputs()[0].shape)
+    _, height, width = _find_input_layout(sess.get_inputs()[0].shape)
 
     if model_name.startswith("animetimm"):
         steps = preprocess["test"]
-        pad = tuple(next(s for s in steps if s["type"] == "pad_to_size")["size"])
+        pad_step = next(s for s in steps if s["type"] == "pad_to_size")
+        pad = tuple(pad_step["size"])
+        # torch has no lanczos; bicubic is the closest antialiased mode.
+        # "nearest-exact" matches PIL's NEAREST, torch's "nearest" does not.
+        pad_mode = {"nearest": "nearest-exact", "bicubic": "bicubic", "lanczos": "bicubic"}.get(
+            pad_step.get("interpolation"), "bilinear")
         resize = next(s for s in steps if s["type"] == "resize")["size"]
         crop = next(s for s in steps if s["type"] == "center_crop")["size"]
         norm = next(s for s in steps if s["type"] == "normalize")
         return ModelSpec(sess, df, model_name, preprocess,
                          lambda x, as_tensor=False: _prep_animetimm(
-                             x, pad, resize, crop, norm["mean"], norm["std"], as_tensor),
+                             x, pad, resize, crop, norm["mean"], norm["std"], as_tensor, pad_mode),
                          "animetimm", replace_underscore)
     if model_name.startswith("camie"):
         return ModelSpec(sess, df, model_name, preprocess,
                          lambda x, as_tensor=False: _prep_camie(x, height, width, as_tensor),
                          "camie", replace_underscore)
     if model_name.startswith("pixai-tagger-v1"):
-        # v1.0 letterboxes on black; v0.9 used mid-grey.
         return ModelSpec(sess, df, model_name, preprocess,
-                         lambda x, as_tensor=False: _prep_pixai(x, height, width, 0.0, as_tensor),
+                         lambda x, as_tensor=False: _prep_pixai(x, height, width, as_tensor),
                          "plain", replace_underscore)
     if model_name.startswith("pixai"):
         return ModelSpec(sess, df, model_name, preprocess,
-                         lambda x, as_tensor=False: _prep_pixai(x, height, width, as_tensor=as_tensor),
-                         "plain", replace_underscore)
+                         lambda x, as_tensor=False: _prep_squash(x, height, width, "bilinear", as_tensor),
+                         "pixai", replace_underscore)
     if model_name.startswith("cl-tagger-v2"):
         return ModelSpec(sess, df, model_name, preprocess,
-                         lambda x, as_tensor=False: _prep_cl_v2(x, height, height, as_tensor),
+                         lambda x, as_tensor=False: _prep_squash(x, height, height, "bicubic", as_tensor),
                          "sigmoid", replace_underscore)
     if model_name.startswith("cl-tagger-v1"):
         return ModelSpec(sess, df, model_name, preprocess,
-                         lambda x, as_tensor=False: _prep_cl_v1(x, height, layout == "NCHW", as_tensor),
+                         lambda x, as_tensor=False: _prep_cl_v1(x, height, as_tensor),
                          "sigmoid", replace_underscore)
     return ModelSpec(sess, df, model_name, preprocess,
                      lambda x, as_tensor=False: _prep_wd(x, height, width, as_tensor),
@@ -763,12 +785,14 @@ def get_tag(probs, tags_df: pd.DataFrame, spec=None, threshold=0.35, character_t
         general = spec.escaped_names[general].tolist()
         character = spec.escaped_names[character].tolist()
 
-    remove = [s.strip() for s in exclude_tags.lower().split(",")] if exclude_tags else []
+    # Match ignoring case and underscores vs spaces, so the replace_underscore
+    # setting does not decide whether an exclusion applies.
+    remove = {s.strip().replace("_", " ") for s in exclude_tags.lower().split(",")} if exclude_tags else set()
     if remove:
         def _apply_exclude(tag_list):
-            # Escape for output, but match against the unescaped name.
-            return [_escape(t) for t in tag_list
-                    if t.replace("\\(", "(").replace("\\)", ")").lower() not in remove]
+            # Tags are already escaped for output; match against the unescaped name.
+            return [t for t in tag_list
+                    if t.replace("\\(", "(").replace("\\)", ")").replace("_", " ").lower() not in remove]
         character = _apply_exclude(character)
         general = _apply_exclude(general)
 
@@ -827,18 +851,19 @@ async def download_model(model: str) -> None:
     preprocess_url = config.get("preprocess_url", {}).get(model, config["model_url"][model])
     preprocess_url = f"{preprocess_url.replace('{HF_ENDPOINT}', hf_endpoint).rstrip('/')}/resolve/main"
 
-    # Support HF token for gated models.
+    # Support HF token for gated models. Only sent to huggingface.co, never to a mirror.
     # Priority: HF_TOKEN env var -> HUGGINGFACE_TOKEN env var -> huggingface_hub cache (hf auth login)
-    hf_token = os.getenv("HF_TOKEN", os.getenv("HUGGINGFACE_TOKEN"))
-    if not hf_token:
-        try:
-            from huggingface_hub import get_token
-            hf_token = get_token()
-        except Exception:
-            pass
     headers = {}
-    if hf_token:
-        headers["Authorization"] = f"Bearer {hf_token}"
+    if urlparse(hf_endpoint).hostname == "huggingface.co":
+        hf_token = os.getenv("HF_TOKEN", os.getenv("HUGGINGFACE_TOKEN"))
+        if not hf_token:
+            try:
+                from huggingface_hub import get_token
+                hf_token = get_token()
+            except Exception:
+                pass
+        if hf_token:
+            headers["Authorization"] = f"Bearer {hf_token}"
 
     progress = _DownloadProgress()
     async with aiohttp.ClientSession(headers=headers) as session:
@@ -1066,15 +1091,17 @@ class LoadBooruTaggerModel(io.ComfyNode):
                 # v1.0 ships per-category recommended thresholds but no per-tag
                 # column. Derive best_threshold from the original category codes
                 # *before* remapping, so each source category keeps its own value
-                # (style 0.15 and copyright 0.24 would otherwise inherit the
-                # general/character values they are merged into).
+                # (artist 0.15 and copyright 0.24 would otherwise inherit the
+                # character value they are merged into).
                 _pixai_v1_thr = {0: 0.17, 1: 0.15, 3: 0.24, 4: 0.27, 5: 0.17, 9: 0.41}
                 df["best_threshold"] = df["category"].map(lambda c: _pixai_v1_thr.get(c, 1.0))
                 # v1.0 uses its own category codes and block order; map them onto
-                # the extension convention (0 general, 1 rating, 3 meta, 4 char):
-                #   0 general -> 0, 1 style -> 0, 3 copyright -> 4,
+                # the extension convention (0 general, 1 rating, 3 meta, 4 char).
+                # Category 1 is called "style" on the model card but holds artist
+                # names, so it goes with character/copyright like other models:
+                #   0 general -> 0, 1 artist -> 4, 3 copyright -> 4,
                 #   4 character -> 4, 5 meta -> 3, 9 rating -> 1
-                _cat_map_pixai_v1 = {0: 0, 1: 0, 3: 4, 4: 4, 5: 3, 9: 1}
+                _cat_map_pixai_v1 = {0: 0, 1: 4, 3: 4, 4: 4, 5: 3, 9: 1}
                 df["category"] = df["category"].map(lambda c: _cat_map_pixai_v1.get(c, 3))
             else:
                 # Remap WD rating tags from category 9 -> 1 (rating)
